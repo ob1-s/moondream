@@ -413,7 +413,7 @@ def main():
 
     config = MoondreamConfig()
     model = MoondreamModel(config)
-    load_weights_into_model(MODEL_PATH, model, device="cuda:0")
+    load_weights_into_model(MODEL_PATH, model, device="cuda:1")
 
     for p in model.vision.parameters(): p.requires_grad = False
     for p in model.text.parameters():   p.requires_grad = False
