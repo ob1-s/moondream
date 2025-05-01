@@ -563,7 +563,7 @@ def main():
     # Replace with your desired output location.
     save_file(
         model.state_dict(),
-        "moondream_finetune.safetensors",
+        "moondream_finetune_v1.safetensors",
     )
 
 
