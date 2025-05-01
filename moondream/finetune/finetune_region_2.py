@@ -397,7 +397,7 @@ class GroundedDetection(Dataset):
 
 def main():
     if torch.cuda.is_available():
-        torch.set_default_device("cuda")
+        torch.set_default_device("cuda:1")
     elif torch.backends.mps.is_available():
         torch.set_default_device("mps")
 
