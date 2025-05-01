@@ -1,3 +1,4 @@
+#@title weights.py
 import safetensors
 import torch
 import torch.nn as nn
@@ -151,7 +152,7 @@ def load_weights_from_pt(weights_file: str, model: nn.Module) -> None:
         _load_weights(lambda x: tensors[x], model)
 
 
-def load_weights_into_model(weights_file: str, model: nn.Module) -> None:
+def load_weights_into_model(weights_file: str, model: nn.Module, device=None) -> None:
     """
     Load weights from either a safetensors or PyTorch file directly into a MoondreamModel instance.
 
@@ -159,6 +160,9 @@ def load_weights_into_model(weights_file: str, model: nn.Module) -> None:
         weights_file: Path to weights file (either .safetensors or .pt)
         model: MoondreamModel instance to load weights into
     """
+    if device is not None:
+        model.to(device)
+
     if weights_file.endswith(".safetensors"):
         load_weights_from_safetensors(weights_file, model)
     else:
