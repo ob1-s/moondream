@@ -28,7 +28,7 @@ import random
 
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
-MODEL_PATH = "/content/moondream/models/moondream_base.safetensors"
+MODEL_PATH = "/kaggle/working/moondream/models/moondream_base.safetensors"
 LR = 3e-5
 EPOCHS = 8
 GRAD_ACCUM_STEPS = 64
@@ -600,7 +600,7 @@ def main():
     # Replace with your desired output location.
     save_file(
         model.state_dict(),
-        "moondream_finetune.safetensors",
+        "moondream_finetune_v2.safetensors",
     )
 
 
