@@ -1,3 +1,4 @@
+#@title moondream.py
 import torch
 import torch.nn as nn
 import random
@@ -484,6 +485,57 @@ class MoondreamModel(nn.Module):
                 next_token = torch.argmax(logits, dim=-1)
 
         return out
+
+    def detect_with_reference(
+        self,
+        image: Union[Image.Image, EncodedImage],
+        reference: Union[Image.Image, EncodedImage],
+        settings: Optional[ObjectSamplingSettings] = None,
+    ):
+        """
+        Detect objects in `image` matching `reference` by:
+         - encoding each separately (so you can reuse or cache them),
+         - concatenating their caches,
+         - then running the region head as usual.
+        """
+        # 1) get separate EncodedImage for each
+        enc_img = image if isinstance(image, EncodedImage) else self.encode_image(image)
+        enc_ref = reference if isinstance(reference, EncodedImage) else self.encode_image(reference)
+
+        # 2) stitch their caches together
+        #    note: pos will be sum of their prefix lengths
+        total_pos = enc_img.pos + enc_ref.pos
+        merged_caches = []
+        for (k1, v1), (k2, v2) in zip(enc_img.caches, enc_ref.caches):
+            # k1: [1, H, pos1, D], k2: [1, H, pos2, D]
+            k = torch.cat([k1, k2], dim=2)  # along seq dimension
+            v = torch.cat([v1, v2], dim=2)
+            merged_caches.append((k, v))
+
+        # 3) load that merged cache back into the model
+        merged = EncodedImage(pos=total_pos, caches=merged_caches)
+        self.load_encoded_image(merged)
+
+        # 4) build & prefill a tiny detect prompt
+        detect_prompt = "\n\nDetect <REF>\n\n"
+        prompt_ids = self.tokenizer.encode(detect_prompt).ids
+        prompt_tokens = torch.tensor([prompt_ids], device=self.device)
+
+        _, hidden, next_token, pos_after = self._prefill_prompt(
+            prompt_tokens, total_pos, temperature=0, top_p=0
+        )
+        hidden = hidden[:, -1:, :]
+
+        # 5) decode region tokens as normal
+        max_objects = (
+            settings.get("max_objects", DEFAULT_MAX_OBJECTS)
+            if settings
+            else DEFAULT_MAX_OBJECTS
+        )
+        objs = self._generate_points(
+            hidden, next_token, pos_after, include_size=True, max_objects=max_objects
+        )
+        return {"objects": objs}
 
     def detect(
         self,
