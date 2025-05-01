@@ -1,3 +1,4 @@
+#@title sample.py
 import argparse
 import json
 import os
@@ -39,7 +40,7 @@ if __name__ == "__main__":
     image_path = args.image
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found at {image_path}")
-    image = Image.open(image_path)
+    image = Image.open(image_path).convert("RGB")
 
     if not args.benchmark:
         encoded_image = model.encode_image(image)
@@ -51,22 +52,11 @@ if __name__ == "__main__":
         print()
         print()
 
-        # Regular caption
-        print("Caption: normal")
-        for t in model.caption(encoded_image, "normal", stream=True)["caption"]:
-            print(t, end="", flush=True)
-        print()
-        print()
-
-        # Query
-        print("Query:", args.prompt)
-        for t in model.query(encoded_image, args.prompt, stream=True)["answer"]:
-            print(t, end="", flush=True)
-        print()
-        print()
-
         # Detect
-        obj = "hand"
+        model_name = args.model.split("/")[-1].split(".")[0]
+        model_name = model_name.split("_")[-1]
+
+        obj = "blaster"
         print(f"Detect: {obj}")
         objs = model.detect(encoded_image, obj)["objects"]
         print(f"Found {len(objs)}")
@@ -80,21 +70,27 @@ if __name__ == "__main__":
                 obj["y_max"] * image.height,
             )
             draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=2)
-        image.save("detect.jpg")
+        image.save(f"/content/{model_name}_detect.png")
 
-        # Point
-        obj = "ear"
-        print(f"Point: {obj}")
-        points = model.point(encoded_image, obj)["points"]
-        print(f"Found {len(points)}")
+        objs = []
+        print(f"Detect <REF>")
+        objs = model.detect_with_reference(
+          encoded_image,
+          Image.open("/content/blaster-d.png")
+        )["objects"]
+        print(f"Found {len(objs)}")
+        print()
         draw = ImageDraw.Draw(image)
-        for point in points:
-            x, y = point["x"] * image.width, point["y"] * image.height
-            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill="red")
-        image.save("point.jpg")
+        for obj in objs:
+            x_min, y_min, x_max, y_max = (
+                obj["x_min"] * image.width,
+                obj["y_min"] * image.height,
+                obj["x_max"] * image.width,
+                obj["y_max"] * image.height,
+            )
+            draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=2)
+        image.save(f"/content/{model_name}_detect_ref.png")
 
-        # Detect gaze
-        model.detect_gaze(encoded_image, (0.5, 0.5))
     else:
         torch._dynamo.reset()
         model.compile()
