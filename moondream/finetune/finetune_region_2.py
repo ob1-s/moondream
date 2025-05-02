@@ -175,6 +175,51 @@ def eval_detect_inline(dataset, eval_idxs, model):
         torch.tensor([suffix_ids], device=model.device),
         model.text,
     )  # [1, suffix_len, D]
+
+    HARDCODED_TEST_IMG_BASE = Image.open("./Preview.png")
+    HARDCODED_TEST_IMG_obj_1 = Image.open("./blaster-d.png")
+    HARDCODED_TEST_IMG_obj_2 = Image.open("./blaster-p.png")
+    HARDCODED_TEST_IMG_obj_3 = Image.open("./target-detail.png")
+
+    # RUN HARDCODED TEST
+    ref_emb = model._run_vision_encoder(HARDCODED_TEST_IMG_obj_1)[None]
+    result = model.detect_with_inline_reference(
+        HARDCODED_TEST_IMG_BASE,
+        ref_emb,
+        settings={"max_objects": DEFAULT_MAX_OBJECTS},
+    )
+    objs = result["objects"]
+    
+    preds.append(objs)      # objs is already a list of dicts with normalized corners
+
+    print(f"\nRUNNING EVAL for HARDCODED TEST")
+    print("RESULT", str(objs))
+        
+    vis = HARDCODED_TEST_IMG_BASE.convert("RGB").copy()
+    draw = ImageDraw.Draw(vis)
+    w_img, h_img = vis.size
+    
+    for o in objs:
+        # normalized coords:
+        x_min_n, y_min_n = o["x_min"], o["y_min"]
+        x_max_n, y_max_n = o["x_max"], o["y_max"]
+    
+        # convert to pixels
+        x0 = x_min_n * w_img
+        y0 = y_min_n * h_img
+        x1 = x_max_n * w_img
+        y1 = y_max_n * h_img
+    
+        draw.rectangle(
+            [x0, y0, x1, y1],
+            outline="red",
+            width=2,
+        )
+        
+    wandb.log({
+        "eval/hardcoded_test_1": wandb.Image(vis, caption="Detect via native API")
+    })
+    
         
     for idx in eval_idxs:
         sample = dataset[idx]
