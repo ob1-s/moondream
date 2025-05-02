@@ -175,7 +175,7 @@ def eval_detect(dataset, eval_idxs, model):
         if idx == first_idx:
             print(f"RUNNING EVAL for class `{sample_class}`")
             print("RESULT", str(objs))
-            print(f"EXPECTED: {sample["boxes"]}")
+            print(f"EXPECTED: {sample['boxes']}")
             
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
