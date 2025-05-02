@@ -318,7 +318,7 @@ def main():
             total_loss = 0.0
             for class_name, boxes_list in boxes_by_class.items():
                 with torch.no_grad():
-                    instruction = f"\n\nDetect: {class_name.replace('-', ' '}\n\n"
+                    instruction = f"\n\nDetect: {class_name.replace('-', ' ')}\n\n"
                     instruction_tokens = model.tokenizer.encode(instruction).ids
                     instruction_emb = text_encoder(
                         torch.tensor([[instruction_tokens]], device=model.device),
