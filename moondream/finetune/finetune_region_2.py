@@ -186,8 +186,8 @@ def eval_detect_inline(dataset, eval_idxs, model):
         with torch.no_grad():
             img_emb_flat = model._run_vision_encoder(sample["image"])      # [D]
             ref_emb_flat = model._run_vision_encoder(sample["reference"])  # [D]
-            img_emb = img_emb_flat.to(device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
-            ref_emb = ref_emb_flat.to(device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
+            img_emb = img_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
+            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
 
             # 2. Construct Full Prompt Embedding (Mirrors Training Order)
             # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
