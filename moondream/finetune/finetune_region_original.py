@@ -169,12 +169,18 @@ def eval_detect(dataset, eval_idxs, model):
         objs = result["objects"]  # list of {x_min, y_min, x_max, y_max}
 
         gt_boxes = []
-        for x_c, y_c, w_n, h_n in sample["boxes"].detach().cpu().tolist():
-            x_min = x_c - w_n / 2
-            y_min = y_c - h_n / 2
-            x_max = x_c + w_n / 2
-            y_max = y_c + h_n / 2
-            gt_boxes.append([x_min, y_min, x_max, y_max])
+        # sample["boxes"] is now normalized [x_min, y_min, width, height]
+        for x_min_n, y_min_n, w_n, h_n in sample["boxes"].detach().cpu().tolist():
+             # Convert to normalized [x_min, y_min, x_max, y_max] for mAP calculation
+             # (Assuming model.detect outputs this format and compute_iou expects it)
+             x_max_n = x_min_n + w_n
+             y_max_n = y_min_n + h_n
+             # Clamp to be safe, although clamping in __getitem__ might be sufficient
+             x_min_n = max(0.0, min(1.0, x_min_n))
+             y_min_n = max(0.0, min(1.0, y_min_n))
+             x_max_n = max(0.0, min(1.0, x_max_n))
+             y_max_n = max(0.0, min(1.0, y_max_n))
+             gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n])
         
         preds.append(objs)      # objs is already a list of dicts with normalized corners
         gts.append(gt_boxes)    # now a list of 4‑floats matching the preds format
@@ -206,14 +212,25 @@ def eval_detect(dataset, eval_idxs, model):
                     width=2,
                 )
             
+            # Draw Ground Truth boxes (Green) - CORRECTED
             for bb in sample["boxes"]:
-                x_c, y_c, w_n, h_n = bb.detach().cpu().tolist()
-                x_min = (x_c - w_n/2) * w_img
-                y_min = (y_c - h_n/2) * h_img
-                x_max = (x_c + w_n/2) * w_img
-                y_max = (y_c + h_n/2) * h_img
+                # bb is now [x_min_n, y_min_n, width_n, height_n]
+                x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
+
+                # Convert normalized [xmin, ymin, width, height] to pixel [xmin, ymin, xmax, ymax]
+                x_min_px = x_min_n * w_img
+                y_min_px = y_min_n * h_img
+                x_max_px = (x_min_n + width_n) * w_img
+                y_max_px = (y_min_n + height_n) * h_img
+
+                # Optional: Clamp pixel coordinates to image boundaries for robustness
+                x_min_px = max(0, min(w_img - 1, x_min_px))
+                y_min_px = max(0, min(h_img - 1, y_min_px))
+                x_max_px = max(0, min(w_img - 1, x_max_px))
+                y_max_px = max(0, min(h_img - 1, y_max_px))
+
                 draw.rectangle(
-                    [x_min, y_min, x_max, y_max],
+                    [x_min_px, y_min_px, x_max_px, y_max_px],
                     outline="green",
                     width=2,
                 )
@@ -243,16 +260,28 @@ class GroundedDetection(Dataset):
         bboxes = row["bboxes"]
         labels = [row["asset_name"] for _ in row["bboxes"]]
 
-        # convert to YOLO format
+       # convert pixel [xmin, ymin, xmax, ymax] to normalized [xmin, ymin, width, height]
         norm_boxes = []
+        w_img, h_img = image.size
         for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox
-            w_img, h_img = image.size
-            x_c = (x_min + x_max) / 2 / w_img
-            y_c = (y_min + y_max) / 2 / h_img
-            w_n = (x_max - x_min) / w_img
-            h_n = (y_max - y_min) / h_img
-            norm_boxes.append([x_c, y_c, w_n, h_n])
+            x_min_px, y_min_px, x_max_px, y_max_px = bbox
+
+            # Calculate normalized top-left corner
+            x_min_norm = x_min_px / w_img
+            y_min_norm = y_min_px / h_img
+
+            # Calculate normalized width and height
+            width_norm = (x_max_px - x_min_px) / w_img
+            height_norm = (y_max_px - y_min_px) / h_img
+
+            # Optional: Clamp values to [0.0, 1.0] to avoid numerical issues
+            x_min_norm = max(0.0, min(1.0, x_min_norm))
+            y_min_norm = max(0.0, min(1.0, y_min_norm))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            # Append in the correct [x_min, y_min, width, height] format
+            norm_boxes.append([x_min_norm, y_min_norm, width_norm, height_norm])
 
         # group by label
         objects = {}
