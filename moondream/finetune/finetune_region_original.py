@@ -158,13 +158,18 @@ def eval_detect(dataset, eval_idxs, model):
     for idx in eval_idxs:
         sample = dataset[idx]
 
+        sample_class = sample["class_names"][0].replace('-', ' '),
+        print(f"RUNNING EVAL for class `{sample_class}`")
+
         # 1) call the native helper instead of manual cache‐merge
         result = model.detect(
             sample["image"],
-            sample["class_names"][0],
+            sample_class,
             settings={"max_objects": DEFAULT_MAX_OBJECTS},
         )
         objs = result["objects"]  # list of {x_min, y_min, x_max, y_max}
+
+        print("RESULT", str(objs))
 
         preds.append(objs)
         gts.append(sample["boxes"])
@@ -343,7 +348,7 @@ def main():
 
                     # Create coordinate bin labels - unchanged
                     coord_labels = [
-                        min(max(torch.round(p * 1023), 0), 1023) for p in bb[:2]
+                        int(min(max(torch.round(p * 1023), 0), 1023).item()) for p in bb[:2]
                     ]
 
                     # Create size bin labels using log-scale mapping
