@@ -179,7 +179,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
     for idx in eval_idxs:
         sample = dataset[idx]
 
-        sample_class = sample["classes"][0]
+        sample_class = sample["class_names"][0]
 
         ref_emb = model._run_vision_encoder(sample["reference"])[None]
         result = model.detect_with_inline_reference(
