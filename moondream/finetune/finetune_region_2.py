@@ -166,17 +166,17 @@ def eval_detect_inline(dataset, eval_idxs, model):
         suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
         prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=device),
+            torch.tensor([prefix_ids], device=model.device),
             model.text,
         )  # Shape: [1, prefix_len, D]
 
         suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=device),
+            torch.tensor([suffix_ids], device=model.device),
             model.text,
         )  # Shape: [1, suffix_len, D]
 
         bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
+            torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
             model.text,
         ) # Shape: [1, 1, D]
 
@@ -206,7 +206,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
 
             # --- Manual Transformer Forward Pass ---
             hidden_states = full_prompt_emb
-            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
+            position_ids = torch.arange(0, total_prompt_len, device=model.device).unsqueeze(0)
             for block in model.text.blocks:
                  block_output = block(
                      hidden_states,
