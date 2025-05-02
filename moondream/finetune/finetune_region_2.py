@@ -188,6 +188,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
     suffix_emb = text_encoder(
         torch.tensor([suffix_ids], device=model.device),
         model.text,
+    )  # [1, suffix_len, D]
         
     for idx in eval_idxs:
         sample = dataset[idx]
@@ -195,8 +196,6 @@ def eval_detect_inline(dataset, eval_idxs, model):
         # --- exactly like model.detect() for the scene image ---
         enc_img = model.encode_image(sample["image"])
         model.load_encoded_image(enc_img)
-
-        )  # [1, suffix_len, D]
 
         # 2) project the reference image into a single [1,1,D] token
         ref_emb = model._run_vision_encoder(sample["reference"])[None]  # [1,1,D]
