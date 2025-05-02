@@ -486,112 +486,113 @@ class MoondreamModel(nn.Module):
 
         return out
 
-
-        def detect_with_inline_reference(
+    
+    def detect_with_inline_reference(
         self,
         image: Union[Image.Image, EncodedImage],
-        reference: Union[Image.Image, EncodedImage],
+        reference_embedding: torch.Tensor,
         settings: Optional[ObjectSamplingSettings] = None,
     ):
         """
-        Detects objects in 'image' using 'reference' image as the target class.
-        Constructs a prompt embedding: [BOS] [IMG] [PREFIX] [REF_IMG_EMB] [SUFFIX]
-        and generates bounding boxes.
+        Detect objects in an image based on a reference image embedding provided inline
+        within the prompt sequence, mimicking the training setup.
+
+        Args:
+            image: The scene image (PIL Image or pre-encoded EncodedImage).
+            reference_embedding: The vision embedding of the reference image/object.
+                                 Expected shape: [1, seq_len, dim] or [seq_len, dim].
+                                 This embedding will be placed between the detect prefix
+                                 (with a leading space) and the suffix.
+            settings: Optional dictionary for sampling settings (e.g., max_objects).
+
+        Returns:
+            A dictionary containing the list of detected bounding boxes:
+            {'objects': [{'x_min': float, 'y_min': float, 'x_max': float, 'y_max': float}, ...]}
         """
-        with torch.inference_mode():
-            # 1. Compute vision embeddings for scene + reference
-            # _run_vision_encoder returns shape [1, D] after projection in this context
-            img_emb_flat = self._run_vision_encoder(image) # Shape: [1, D]
-            ref_emb_flat = self._run_vision_encoder(reference) # Shape: [1, D]
+        if self.config.tokenizer.templates["detect"] is None:
+            raise NotImplementedError("Model does not support object detection.")
 
-            # Reshape to [1, 1, D] for sequence concatenation
-            img_emb = img_emb_flat.unsqueeze(1).to(self.device) # Shape: [1, 1, D]
-            ref_emb = ref_emb_flat.unsqueeze(1).to(self.device) # Shape: [1, 1, D]
+        # 1. Encode scene image (this also prefills BOS + image embedding into KV cache)
+        image_encoded = self.encode_image(image)
+        self.load_encoded_image(image_encoded) # Ensure KV cache is loaded
 
-            # 2. Get text embeddings for prefix, suffix, and BOS
-            if self.config.tokenizer.templates["detect"] is None:
-                raise NotImplementedError("Model does not support object detection templates.")
-
-            # Use the "detect" template structure, adding space token (ID 220) before reference embed
-            prefix_ids = self.config.tokenizer.templates["detect"]["prefix"] + [220] # Add space token ID
+        # 2. Prepare prompt components embeddings: Prefix + ReferenceEmbedding + Suffix
+        with torch.no_grad():
+            # Get prefix/suffix IDs from the standard 'detect' template
+            # Add leading space token (ID 220) before the reference embedding, like in training
+            prefix_ids = self.config.tokenizer.templates["detect"]["prefix"] + [220]
             suffix_ids = self.config.tokenizer.templates["detect"]["suffix"]
 
+            # Encode prefix/suffix IDs to embeddings
             prefix_emb = text_encoder(
                 torch.tensor([prefix_ids], device=self.device),
                 self.text,
             ) # Shape: [1, prefix_len, D]
-
             suffix_emb = text_encoder(
                 torch.tensor([suffix_ids], device=self.device),
                 self.text,
             ) # Shape: [1, suffix_len, D]
 
-            bos_emb = text_encoder(
-                torch.tensor([[self.config.tokenizer.bos_id]], device=self.device),
-                self.text,
-            ) # Shape: [1, 1, D]
+            # Ensure reference_embedding has the correct shape [1, ref_len, D] and device/dtype
+            if reference_embedding.ndim == 2:
+                # Input might be [seq_len, dim], add batch dim
+                reference_embedding = reference_embedding.unsqueeze(0)
+            elif reference_embedding.ndim != 3:
+                raise ValueError(
+                    f"reference_embedding must have 2 or 3 dimensions ([seq,dim] or [1,seq,dim]), "
+                    f"got shape {reference_embedding.shape}"
+                )
+            # Ensure device and dtype match the model's text embedding dtype
+            reference_embedding = reference_embedding.to(device=self.device, dtype=prefix_emb.dtype)
 
-            # 3. Construct Full Prompt Embedding: [BOS] [IMG] [PREFIX+SPACE] [REF_IMG_EMB] [SUFFIX]
-            full_prompt_emb = torch.cat([
-                bos_emb,    # [1, 1, D]
-                img_emb,    # [1, 1, D]
-                prefix_emb, # [1, prefix_len, D]
-                ref_emb,    # [1, 1, D] <- Reference image embedding inserted here
-                suffix_emb  # [1, suffix_len, D]
-            ], dim=1) # Concatenates along sequence dim
-            total_prompt_len = full_prompt_emb.size(1)
+            # Concatenate embeddings for the prompt part: [Prefix] [RefEmb] [Suffix]
+            # Example shapes: [1, 5, D] + [1, 729, D] + [1, 1, D] -> [1, 735, D]
+            prompt_emb = torch.cat([prefix_emb, reference_embedding, suffix_emb], dim=1)
+            # Shape: [1, combined_prompt_len, D]
 
-            # 4. Process Prompt using _prefill
-            # --- Reset KV Cache ---
-            # Ensure a clean state as this prompt structure differs from standard query/caption
-            if hasattr(self.text, 'blocks') and self.text.blocks:
-                for block in self.text.blocks:
-                     if hasattr(block, 'kv_cache') and block.kv_cache is not None:
-                         # Zeroing ensures no state leak from previous unrelated operations
-                         if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache.zero_()
-                         if hasattr(block.kv_cache, 'v_cache'): block.kv_cache.v_cache.zero_()
+        # 3. Prefill the concatenated prompt embedding through the text model
+        # Start position is after BOS + image embedding, which encode_image handled
+        pos = image_encoded.pos
 
-            # Prepare inputs for _prefill
-            # Use the model's precomputed causal mask, sliced appropriately
-            if not hasattr(self, 'attn_mask') or self.attn_mask is None:
-                 raise AttributeError("Model 'attn_mask' is not initialized.")
-            # Slice the attention mask for the full prompt length
-            attn_mask = self.attn_mask[:, :, :total_prompt_len, :total_prompt_len]
-            # Create position IDs for the full prompt sequence
-            position_ids = torch.arange(0, total_prompt_len, device=self.device, dtype=torch.long).unsqueeze(0)
+        # Calculate attention mask and position IDs for this new prompt part
+        prompt_len = prompt_emb.size(1)
+        # The mask needs to cover from `pos` to `pos + prompt_len`
+        # self.attn_mask shape is [1, 1, max_ctx, max_ctx]
+        mask = self.attn_mask[:, :, pos : pos + prompt_len, : pos + prompt_len] # Use causal mask for this part too
+        pos_ids = torch.arange(pos, pos + prompt_len, dtype=torch.long, device=self.device)
 
-            # Call _prefill to process the entire prompt and populate the KV cache
-            hidden_states = self._prefill(full_prompt_emb, attn_mask, position_ids)
+        with torch.inference_mode():
+            # Process the prompt embedding using _prefill, updating the KV cache
+            hidden_states = self._prefill(prompt_emb, mask, pos_ids)
+            # hidden_states shape: [1, prompt_len, D]
 
-            # Get the hidden state corresponding to the *last* token of the input prompt
-            # This state will be used to predict the first token of the output (coordinate) sequence
-            last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
+            # Get the hidden state *after* the last token of the prompt embedding
+            last_hidden_state = hidden_states[:, -1:, :] # Shape: [1, 1, D]
 
-            # 5. Predict Initial Token for Generation (should be the start of x-coord)
-            # Use temperature=0 for deterministic coordinate start prediction
-            next_logits = lm_head(last_hidden, self.text) # Use lm_head helper
-            initial_next_token = torch.argmax(next_logits, dim=-1) # Shape: [1, 1]
+            # Calculate logits for the *next* token prediction based on the last hidden state
+            # Note: _prefill doesn't return logits, we compute them if needed
+            # But _generate_points needs the *next_token* predicted from here
+            logits_for_next = lm_head(last_hidden_state, self.text) # Shape: [1, 1, V]
 
-            # 6. Generate Region Points (Bounding Boxes)
-            # Generation starts *after* the full prompt sequence.
-            # The KV cache is already populated by _prefill up to total_prompt_len.
-            gen_pos = total_prompt_len
-            max_objects = (
-                settings.get("max_objects", DEFAULT_MAX_OBJECTS)
-                if settings
-                else DEFAULT_MAX_OBJECTS
-            )
+            # Determine the next token (should be start of coords or EOS) - use argmax for detection
+            next_token = torch.argmax(logits_for_next, dim=-1) # Shape: [1, 1]
 
-            objs = self._generate_points(
-                hidden=last_hidden,                  # Start generation from state after prompt
-                next_token=initial_next_token,       # Use predicted first token (should be x-coord start)
-                pos=gen_pos,                         # Start position for generation KV cache updates
-                include_size=True,                   # We want bounding boxes (x, y, w, h)
-                max_objects=max_objects
-            )
+            # Update the sequence position to be after the processed prompt
+            pos += prompt_len
 
-        # 7. Format and return output
-        return {"objects": objs}
+        # 4. Generate coordinate points starting from the state after the reference prompt
+        max_objects = (
+            settings.get("max_objects", DEFAULT_MAX_OBJECTS)
+            if settings
+            else DEFAULT_MAX_OBJECTS
+        )
+        # Pass the final hidden state, the predicted next token, and the current position
+        objects = self._generate_points(
+            last_hidden_state, next_token, pos, include_size=True, max_objects=max_objects
+        )
+
+        # 5. Return results in the standard format
+        return {"objects": objects}
         
     def detect(
         self,
