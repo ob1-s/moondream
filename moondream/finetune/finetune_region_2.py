@@ -179,16 +179,9 @@ def eval_detect_inline(dataset, eval_idxs, model):
     for idx in eval_idxs:
         sample = dataset[idx]
 
-        # --- exactly like model.detect() for the scene image ---
-        enc_img = model.encode_image(sample["image"])
-        model.load_encoded_image(enc_img)
-
-        # 2) project the reference image into a single [1,1,D] token
-        ref_emb = model._run_vision_encoder(sample["reference"])[None]  # [1,1,D]
-
         result = model.detect_with_inline_reference(
             sample["image"],
-            ref_emb,
+            sample["reference"],
             settings={"max_objects": DEFAULT_MAX_OBJECTS},
         )
         objs = result["objects"]
