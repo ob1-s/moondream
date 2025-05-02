@@ -424,15 +424,12 @@ def main():
     for epoch in range(EPOCHS):
         if epoch:
             random.shuffle(train_idxs)
+
+        frac_class_epoch = 0.8 * (1 - epoch / (EPOCHS - 1))
         
         for sample_idx in train_idxs:
             sample = dataset[sample_idx]
             i += 1
-
-            step_in_batch = (i % GRAD_ACCUM_STEPS)
-            frac_class = 0.8 * (1 - step_in_batch / (GRAD_ACCUM_STEPS - 1))
-            frac_class = max(0.0, min(1.0, frac_class))
-            
 
             torch.cuda.empty_cache()
 
@@ -465,7 +462,7 @@ def main():
 
             # 3) For each “class” (in DetectRef you can ignore the string, we just loop)
             for _cls, boxes_list in boxes_by_class.items():
-                use_class = (random.random() < frac_class)
+                use_class = (random.random() < frac_class_epoch)
                 
                 with torch.no_grad():
                     instruction = f"\n\nDetect {'<REF>' if not use_class else _cls.replace('-', ' ')}\n\n"
