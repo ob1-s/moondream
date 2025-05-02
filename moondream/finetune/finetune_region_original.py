@@ -187,7 +187,7 @@ def eval_detect(dataset, eval_idxs, model):
                 )
             for _bbox in sample["boxes"]:
                 draw.rectangle(
-                    _bbox,
+                    _bbox.squeeze(0).detach().cpu().tolist(),
                     outline="green",
                     width=2,
                 )
