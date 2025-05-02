@@ -123,19 +123,19 @@ def compute_map(preds, gts, iou_threshold=0.5):
         return torch.tensor(box_list)
 
     all_precisions = []
-    for pred_raw, true_tensor in zip(preds, gts):
+    for pred_raw, true_raw in zip(preds, gts):
         pred_tensor = to_tensor(pred_raw)
-        true_boxes = true_tensor.detach().cpu().tolist()
+        true_tensor = to_tensor(true_raw)
+
         pred_boxes = pred_tensor.tolist()
+        true_boxes = true_tensor.tolist()
 
         matched = set()
         tp = 0
         for pb in pred_boxes:
-            # find best matching gt
             best_iou, best_j = 0, -1
             for j, tb in enumerate(true_boxes):
-                if j in matched:
-                    continue
+                if j in matched: continue
                 iou = compute_iou(pb, tb)
                 if iou > best_iou:
                     best_iou, best_j = iou, j
@@ -181,7 +181,7 @@ def eval_detect(dataset, eval_idxs, model):
 
         # 2) on the very first eval sample, draw & log its predictions
         if idx == first_idx:
-            print(f"RUNNING EVAL for class `{sample_class}`")
+            print(f"\nRUNNING EVAL for class `{sample_class}`")
             print("RESULT", str(objs))
             print(f"EXPECTED: {sample['boxes']}")
             
