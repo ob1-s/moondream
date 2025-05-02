@@ -185,9 +185,15 @@ def eval_detect(dataset, eval_idxs, model):
                     outline="red",
                     width=2,
                 )
-            for _bbox in sample["boxes"]:
+            w_img, h_img = vis.size
+            for bb in sample["boxes"]:
+                x_c, y_c, w_n, h_n = bb.detach().cpu().tolist()
+                x_min = (x_c - w_n/2) * w_img
+                y_min = (y_c - h_n/2) * h_img
+                x_max = (x_c + w_n/2) * w_img
+                y_max = (y_c + h_n/2) * h_img
                 draw.rectangle(
-                    _bbox.squeeze(0).detach().cpu().tolist(),
+                    [x_min, y_min, x_max, y_max],
                     outline="green",
                     width=2,
                 )
