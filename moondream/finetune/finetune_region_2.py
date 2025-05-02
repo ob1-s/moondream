@@ -436,6 +436,7 @@ def main():
     load_weights_into_model(MODEL_PATH, model, device="cuda:1")
 
     for p in model.vision.parameters(): p.requires_grad = False
+    for p in model.region.parameters(): p.requires_grad = True
     for p in model.text.parameters():   p.requires_grad = True
     for p in model.vision.proj_mlp.fc1.parameters(): p.requires_grad = True
     for p in model.vision.proj_mlp.fc2.parameters(): p.requires_grad = True
