@@ -284,8 +284,8 @@ def main():
     dataset = GroundedDetection()
     print(f"GroundedDetection: {len(dataset)} items.")
     idxs = list(range(len(dataset)))
-    train_idxs = idxs[:2048]
-    eval_idxs = idxs[2048:2048+128]
+    train_idxs = idxs[:1024]
+    eval_idxs = idxs[1024:1024+128]
 
     total_steps = EPOCHS * len(train_idxs) // GRAD_ACCUM_STEPS
     pbar = tqdm(total=total_steps)
