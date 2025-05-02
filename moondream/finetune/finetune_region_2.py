@@ -176,9 +176,19 @@ def eval_detect_inline(dataset, eval_idxs, model):
     first_idx = eval_idxs[0]
 
     # grab the precomputed prefix / suffix id lists from your tokenizer
-    prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]
+    prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
     suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
+    # 1) text‐encode the prefix and suffix (they’re fixed)
+    prefix_emb = text_encoder(
+        torch.tensor([prefix_ids], device=model.device),
+        model.text,
+    )  # [1, prefix_len, D]
+
+    suffix_emb = text_encoder(
+        torch.tensor([suffix_ids], device=model.device),
+        model.text,
+        
     for idx in eval_idxs:
         sample = dataset[idx]
 
@@ -186,15 +196,6 @@ def eval_detect_inline(dataset, eval_idxs, model):
         enc_img = model.encode_image(sample["image"])
         model.load_encoded_image(enc_img)
 
-        # 1) text‐encode the prefix and suffix (they’re fixed)
-        prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=model.device),
-            model.text,
-        )  # [1, prefix_len, D]
-
-        suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=model.device),
-            model.text,
         )  # [1, suffix_len, D]
 
         # 2) project the reference image into a single [1,1,D] token
@@ -478,7 +479,7 @@ def main():
 
             with torch.no_grad():
                 prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]
-                prefix_ids_w_leading_space = model.config.tokenizer.templates["detect"]["prefix"]+model.tokenizer.encode(" ").ids
+                prefix_ids_w_leading_space = model.config.tokenizer.templates["detect"]["prefix"]+[220]
                 suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
                 prefix_emb = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
                 prefix_emb_w_leading_space = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
@@ -507,12 +508,13 @@ def main():
             total_loss = 0.0
 
             # 3) For each “class”
-            for _cls, boxes_list in boxes_by_class.items():     
+            for _cls, boxes_list in boxes_by_class.items():
+                use_class = (random.random() < frac_class)
                 if use_class:
                     with torch.no_grad():
                         cls_emb = text_encoder(torch.tensor([
                             model.tokenizer.encode(
-                                " "+_cls.replace('-', ' ')
+                                " "+_cls.replace('-', ' ').strip()
                             ).ids
                         ], device=model.device), model.text).squeeze(0)  
                     
