@@ -429,8 +429,9 @@ def main():
             sample = dataset[sample_idx]
             i += 1
 
-            step_in_batch = (i - 1) % GRAD_ACCUM_STEPS
-            frac_class = 1.0 - step_in_batch / GRAD_ACCUM_STEPS  # starts 1.0 → ends ~0.0
+            step_in_batch = (i % GRAD_ACCUM_STEPS)
+            frac_class = 0.8 * (1 - step_in_batch / (GRAD_ACCUM_STEPS - 1))
+            frac_class = max(0.0, min(1.0, frac_class))
             
 
             torch.cuda.empty_cache()
