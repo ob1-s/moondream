@@ -79,6 +79,7 @@ def region_loss(
     return c_loss + s_loss
 
 
+
 def compute_iou(box1, box2):
     # box: [x_min, y_min, x_max, y_max]
     xA = max(box1[0], box2[0])
@@ -155,144 +156,175 @@ def compute_map(preds, gts, iou_threshold=0.5):
     return sum(all_precisions) / len(all_precisions) if all_precisions else 0.0
 
 
-def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type hint
+def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
     first_idx = eval_idxs[0]
-    device = model.device
 
     # grab the precomputed prefix / suffix id lists from your tokenizer
-    with torch.no_grad():
-        try:
-            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"] + [220]
-            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-        except KeyError:
-            print("Warning: Using fallback 'detect' template.")
-            prefix_ids = model.tokenizer.encode("\n\nDetect:").ids + [220]
-            suffix_ids = model.tokenizer.encode("\n\n").ids
+    prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+    suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
-        prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=device),
-            model.text,
-        )
-        suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=device),
-            model.text,
-        )
-        bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
-            model.text,
-        )
+    # 1) text‐encode the prefix and suffix (they’re fixed)
+    prefix_emb = text_encoder(
+        torch.tensor([prefix_ids], device=model.device),
+        model.text,
+    )  # [1, prefix_len, D]
 
+    suffix_emb = text_encoder(
+        torch.tensor([suffix_ids], device=model.device),
+        model.text,
+    )  # [1, suffix_len, D]
+        
     for idx in eval_idxs:
         sample = dataset[idx]
-        if sample is None or "image" not in sample or "reference" not in sample or "boxes" not in sample:
-            continue
 
-        with torch.no_grad():
-            img_emb_flat = model._run_vision_encoder(sample["image"])
-            ref_emb_flat = model._run_vision_encoder(sample["reference"])
-            img_emb = img_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
-            ref_emb = ref_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
+        # --- exactly like model.detect() for the scene image ---
+        enc_img = model.encode_image(sample["image"])
+        model.load_encoded_image(enc_img)
 
-            # 2. Construct Full Prompt Embedding
-            full_prompt_emb = torch.cat([
-                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb
-            ], dim=1)
-            total_prompt_len = full_prompt_emb.size(1)
+        # 2) project the reference image into a single [1,1,D] token
+        ref_emb = model._run_vision_encoder(sample["reference"])[None]  # [1,1,D]
 
-            # 3. Process Prompt using _prefill (Replaces Manual Loop)
-            # --- Reset KV Cache ---
-            if hasattr(model.text, 'blocks') and model.text.blocks:
-                for block in model.text.blocks:
-                     if hasattr(block, 'kv_cache') and block.kv_cache is not None:
-                         if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache.zero_()
-                         if hasattr(block.kv_cache, 'v_cache'): block.kv_cache.v_cache.zero_()
+        result = model.detect_with_inline_reference(
+            sample["image"],
+            ref_emb,
+            settings={"max_objects": DEFAULT_MAX_OBJECTS},
+        )
+        objs = result["objects"]
 
-            # --- START FIX ---
-            # Prepare inputs for _prefill
-            # Use the model's precomputed causal mask, sliced appropriately
-            attn_mask = model.attn_mask[:, :, :total_prompt_len, :total_prompt_len]
-            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
-
-            # Call _prefill to process the entire prompt and populate cache
-            hidden_states = model._prefill(full_prompt_emb, attn_mask, position_ids)
-            # --- END FIX ---
-
-            # last_hidden is state after the *last token* of the full prompt
-            last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
-
-            # --- Predict Initial Token for Generation ---
-            next_logits = model.text.lm_head(last_hidden)
-            initial_next_token_id = torch.argmax(next_logits, dim=-1)
-
-            # 4. Generate Region Points
-            # Generation starts *after* the full prompt sequence
-            gen_pos = total_prompt_len
-            objs = model._generate_points(
-                last_hidden,
-                next_token=initial_next_token_id, # Use predicted token
-                pos=gen_pos,
-                include_size=True,
-                max_objects=DEFAULT_MAX_OBJECTS
-            )
-
-        # --- Ground Truth Processing (Remains the same) ---
         gt_boxes = []
-        for box_data in sample["boxes"].detach().cpu().tolist():
-             x_min_n, y_min_n, w_n, h_n = box_data
+        # sample["boxes"] is now normalized [x_min, y_min, width, height]
+        for x_min_n, y_min_n, w_n, h_n in sample["boxes"].detach().cpu().tolist():
+             # Convert to normalized [x_min, y_min, x_max, y_max] for mAP calculation
+             # (Assuming model.detect outputs this format and compute_iou expects it)
              x_max_n = x_min_n + w_n
              y_max_n = y_min_n + h_n
+             # Clamp to be safe, although clamping in __getitem__ might be sufficient
              x_min_n = max(0.0, min(1.0, x_min_n))
              y_min_n = max(0.0, min(1.0, y_min_n))
              x_max_n = max(0.0, min(1.0, x_max_n))
              y_max_n = max(0.0, min(1.0, y_max_n))
              gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n])
+        
+        preds.append(objs)      # objs is already a list of dicts with normalized corners
+        gts.append(gt_boxes)    # now a list of 4‑floats matching the preds format
 
-        preds.append(objs)
-        gts.append(gt_boxes)
 
-        # --- Visualization (Remains the same) ---
+        # 2) on the very first eval sample, draw & log its predictions
         if idx == first_idx:
-            sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
-            # Updated print message for clarity
-            print(f"\nRUNNING EVAL (Using _prefill) for class placeholder: `{sample_class}`")
+            print(f"\nRUNNING EVAL for class `{sample_class}`")
             print("RESULT", str(objs))
-            print(f"EXPECTED (norm xywh): {sample['boxes']}")
-
+            print(f"EXPECTED: {sample['boxes']}")
+            
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
             w_img, h_img = vis.size
-
-            for o in objs: # Draw Predictions (Red)
-                x0 = max(0.0, min(1.0, o["x_min"])) * w_img
-                y0 = max(0.0, min(1.0, o["y_min"])) * h_img
-                x1 = max(0.0, min(1.0, o["x_max"])) * w_img
-                y1 = max(0.0, min(1.0, o["y_max"])) * h_img
-                draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
-
-            for bb in sample["boxes"]: # Draw Ground Truth (Green)
+            
+            for o in objs:
+                # normalized coords:
+                x_min_n, y_min_n = o["x_min"], o["y_min"]
+                x_max_n, y_max_n = o["x_max"], o["y_max"]
+            
+                # convert to pixels
+                x0 = x_min_n * w_img
+                y0 = y_min_n * h_img
+                x1 = x_max_n * w_img
+                y1 = y_max_n * h_img
+            
+                draw.rectangle(
+                    [x0, y0, x1, y1],
+                    outline="red",
+                    width=2,
+                )
+            
+            # Draw Ground Truth boxes (Green) - CORRECTED
+            for bb in sample["boxes"]:
+                # bb is now [x_min_n, y_min_n, width_n, height_n]
                 x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
+
+                # Convert normalized [xmin, ymin, width, height] to pixel [xmin, ymin, xmax, ymax]
                 x_min_px = x_min_n * w_img
                 y_min_px = y_min_n * h_img
                 x_max_px = (x_min_n + width_n) * w_img
                 y_max_px = (y_min_n + height_n) * h_img
+
+                # Optional: Clamp pixel coordinates to image boundaries for robustness
                 x_min_px = max(0, min(w_img - 1, x_min_px))
                 y_min_px = max(0, min(h_img - 1, y_min_px))
                 x_max_px = max(0, min(w_img - 1, x_max_px))
                 y_max_px = max(0, min(h_img - 1, y_max_px))
-                draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
 
+                draw.rectangle(
+                    [x_min_px, y_min_px, x_max_px, y_max_px],
+                    outline="green",
+                    width=2,
+                )
             wandb.log({
-                "eval/example_detect_use_prefill": # Updated key
-                    wandb.Image(vis, caption="Detect via Inline Ref (Using _prefill Eval)")
+                "eval/example_detect":
+                    wandb.Image(vis, caption="Detect via native API")
             })
 
-    # --- Return mAP (Remains the same) ---
-    if not preds or not gts:
-        return 0.0
     return compute_map(preds, gts)
-                               
+
+
+class WasteDetection(Dataset):
+    def __init__(self, split: str = "train"):
+        self.dataset: datasets.Dataset = datasets.load_dataset(
+            "moondream/waste_detection", split=split
+        )
+        self.dataset = self.dataset.shuffle(seed=111)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        row = self.dataset[idx]
+        image = row["image"]
+        boxes = row["boxes"]
+        labels = row["labels"]
+
+        objects = {}
+        for box, label in zip(boxes, labels):
+            objects.setdefault(label, []).append(box)
+
+        flat_boxes = []
+        class_names = []
+        for label, box_list in objects.items():
+            for b in box_list:
+                flat_boxes.append(b)
+                class_names.append(label)
+
+        flat_boxes = torch.as_tensor(flat_boxes, dtype=torch.float16)
+        image_id = torch.tensor([idx], dtype=torch.int64)
+
+        return {
+            "image": image,
+            "boxes": flat_boxes,
+            "class_names": class_names,
+            "image_id": image_id,
+        }
+
+
+def to_yolo_format(img_width, img_height, bbox):
+    x_min, y_min, x_max, y_max = bbox
+
+    # 1) Compute center (in pixels)
+    x_center = (x_min + x_max) / 2.0
+    y_center = (y_min + y_max) / 2.0
+
+    # 2) Compute width/height (in pixels)
+    box_w = x_max - x_min
+    box_h = y_max - y_min
+
+    # 3) Normalize by image size
+    x_center_norm = x_center / img_width
+    y_center_norm = y_center / img_height
+    w_norm = box_w / img_width
+    h_norm = box_h / img_height
+
+    return [x_center_norm, y_center_norm, w_norm, h_norm]
+
 
 def collate_references(ref_images):
     """
@@ -353,28 +385,16 @@ class GroundedDetection(Dataset):
         bboxes = row["bboxes"]
         labels = [row["asset_name"] for _ in row["bboxes"]]
 
-        # convert pixel [xmin, ymin, xmax, ymax] to normalized [xmin, ymin, width, height]
+        # convert to YOLO format
         norm_boxes = []
-        w_img, h_img = image.size
         for bbox in bboxes:
-            x_min_px, y_min_px, x_max_px, y_max_px = bbox
-
-            # Calculate normalized top-left corner
-            x_min_norm = x_min_px / w_img
-            y_min_norm = y_min_px / h_img
-
-            # Calculate normalized width and height
-            width_norm = (x_max_px - x_min_px) / w_img
-            height_norm = (y_max_px - y_min_px) / h_img
-
-            # Optional: Clamp values to [0.0, 1.0] to avoid numerical issues
-            x_min_norm = max(0.0, min(1.0, x_min_norm))
-            y_min_norm = max(0.0, min(1.0, y_min_norm))
-            width_norm = max(0.0, min(1.0, width_norm))
-            height_norm = max(0.0, min(1.0, height_norm))
-
-            # Append in the correct [x_min, y_min, width, height] format
-            norm_boxes.append([x_min_norm, y_min_norm, width_norm, height_norm])
+            x_min, y_min, x_max, y_max = bbox
+            w_img, h_img = image.size
+            x_c = (x_min + x_max) / 2 / w_img
+            y_c = (y_min + y_max) / 2 / h_img
+            w_n = (x_max - x_min) / w_img
+            h_n = (y_max - y_min) / h_img
+            norm_boxes.append([x_c, y_c, w_n, h_n])
 
         # group by label
         objects = {}
@@ -468,7 +488,7 @@ def main():
             random.shuffle(train_idxs)
             
         frac_class_epoch = 0.8 * (1 - epoch / (EPOCHS - 1))
-        wandb.log({"frac_class_epoch": frac_class_epoch})
+        wandb.log({"frac_class_epoch": frac_class_epoch}, step=epoch)
         
         for sample_idx in train_idxs:
             sample = dataset[sample_idx]
