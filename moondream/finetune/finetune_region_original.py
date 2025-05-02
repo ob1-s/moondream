@@ -179,13 +179,25 @@ def eval_detect(dataset, eval_idxs, model):
             
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
+            w_img, h_img = vis.size
+            
             for o in objs:
+                # normalized coords:
+                x_min_n, y_min_n = o["x_min"], o["y_min"]
+                x_max_n, y_max_n = o["x_max"], o["y_max"]
+            
+                # convert to pixels
+                x0 = x_min_n * w_img
+                y0 = y_min_n * h_img
+                x1 = x_max_n * w_img
+                y1 = y_max_n * h_img
+            
                 draw.rectangle(
-                    [o["x_min"], o["y_min"], o["x_max"], o["y_max"]],
+                    [x0, y0, x1, y1],
                     outline="red",
                     width=2,
                 )
-            w_img, h_img = vis.size
+            
             for bb in sample["boxes"]:
                 x_c, y_c, w_n, h_n = bb.detach().cpu().tolist()
                 x_min = (x_c - w_n/2) * w_img
