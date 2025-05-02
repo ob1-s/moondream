@@ -155,51 +155,53 @@ def compute_map(preds, gts, iou_threshold=0.5):
     return sum(all_precisions) / len(all_precisions) if all_precisions else 0.0
 
 
-def eval_detect_inline(dataset, eval_idxs, model):
+def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type hint
     model.eval()
     preds, gts = [], []
     first_idx = eval_idxs[0]
+    device = model.device
 
     # grab the precomputed prefix / suffix id lists from your tokenizer
     with torch.no_grad():
-        prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
-        suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
+        try:
+            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"] + [220]
+            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
+        except KeyError:
+            print("Warning: Using fallback 'detect' template.")
+            prefix_ids = model.tokenizer.encode("\n\nDetect:").ids + [220]
+            suffix_ids = model.tokenizer.encode("\n\n").ids
 
         prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=model.device),
+            torch.tensor([prefix_ids], device=device),
             model.text,
-        )  # Shape: [1, prefix_len, D]
-
+        )
         suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=model.device),
+            torch.tensor([suffix_ids], device=device),
             model.text,
-        )  # Shape: [1, suffix_len, D]
-
+        )
         bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
+            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
             model.text,
-        ) # Shape: [1, 1, D]
+        )
 
     for idx in eval_idxs:
         sample = dataset[idx]
+        if sample is None or "image" not in sample or "reference" not in sample or "boxes" not in sample:
+            continue
 
         with torch.no_grad():
-            img_emb_flat = model._run_vision_encoder(sample["image"])      # Expected [729, D]
-            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # Expected [729, D]
-            # --- START FIX ---
-            # Change .unsqueeze(0).unsqueeze(0) to .unsqueeze(0) to match training [None]
-            img_emb = img_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
-            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
-            # --- END FIX ---
+            img_emb_flat = model._run_vision_encoder(sample["image"])
+            ref_emb_flat = model._run_vision_encoder(sample["reference"])
+            img_emb = img_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
+            ref_emb = ref_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
 
-            # 2. Construct Full Prompt Embedding (Mirrors Training Order)
-            # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
+            # 2. Construct Full Prompt Embedding
             full_prompt_emb = torch.cat([
-                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb # Now all are 3D
-            ], dim=1) # Concatenates along sequence dim
-            total_prompt_len = full_prompt_emb.size(1) # Now = 1 + 729 + prefix_len + 729 + suffix_len
+                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb
+            ], dim=1)
+            total_prompt_len = full_prompt_emb.size(1)
 
-            # 3. Manual Forward Pass through Transformer (Replaces _prefill_prompt)
+            # 3. Process Prompt using _prefill (Replaces Manual Loop)
             # --- Reset KV Cache ---
             if hasattr(model.text, 'blocks') and model.text.blocks:
                 for block in model.text.blocks:
@@ -207,17 +209,16 @@ def eval_detect_inline(dataset, eval_idxs, model):
                          if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache.zero_()
                          if hasattr(block.kv_cache, 'v_cache'): block.kv_cache.v_cache.zero_()
 
-            # --- Manual Transformer Forward Pass ---
-            hidden_states = full_prompt_emb
-            # Position IDs should match the total sequence length
-            position_ids = torch.arange(0, total_prompt_len, device=model.device).unsqueeze(0)
-            for block in model.text.blocks:
-                 block_output = block(
-                     hidden_states,
-                 )
-                 hidden_states = block_output[0]
+            # --- START FIX ---
+            # Prepare inputs for _prefill
+            # Use the model's precomputed causal mask, sliced appropriately
+            attn_mask = model.attn_mask[:, :, :total_prompt_len, :total_prompt_len]
+            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
 
-            hidden_states = model.text.norm(hidden_states)
+            # Call _prefill to process the entire prompt and populate cache
+            hidden_states = model._prefill(full_prompt_emb, attn_mask, position_ids)
+            # --- END FIX ---
+
             # last_hidden is state after the *last token* of the full prompt
             last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
 
@@ -225,7 +226,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
             next_logits = model.text.lm_head(last_hidden)
             initial_next_token_id = torch.argmax(next_logits, dim=-1)
 
-            # 4. Generate Region Points (Replaces original call)
+            # 4. Generate Region Points
             # Generation starts *after* the full prompt sequence
             gen_pos = total_prompt_len
             objs = model._generate_points(
@@ -254,7 +255,8 @@ def eval_detect_inline(dataset, eval_idxs, model):
         # --- Visualization (Remains the same) ---
         if idx == first_idx:
             sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
-            print(f"\nRUNNING EVAL (Corrected Dim) for class placeholder: `{sample_class}`")
+            # Updated print message for clarity
+            print(f"\nRUNNING EVAL (Using _prefill) for class placeholder: `{sample_class}`")
             print("RESULT", str(objs))
             print(f"EXPECTED (norm xywh): {sample['boxes']}")
 
@@ -282,13 +284,12 @@ def eval_detect_inline(dataset, eval_idxs, model):
                 draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
 
             wandb.log({
-                "eval/example_detect_corrected_dim": # Updated key
-                    wandb.Image(vis, caption="Detect via Inline Ref (Corrected Dim Eval)")
+                "eval/example_detect_use_prefill": # Updated key
+                    wandb.Image(vis, caption="Detect via Inline Ref (Using _prefill Eval)")
             })
 
     # --- Return mAP (Remains the same) ---
     if not preds or not gts:
-        # print("Warning: No predictions or ground truths to compute mAP.") # Optional
         return 0.0
     return compute_map(preds, gts)
                                
