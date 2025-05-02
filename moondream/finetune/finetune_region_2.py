@@ -179,9 +179,10 @@ def eval_detect_inline(dataset, eval_idxs, model):
     for idx in eval_idxs:
         sample = dataset[idx]
 
+        ref_emb = model._run_vision_encoder(sample["reference"])[None]
         result = model.detect_with_inline_reference(
             sample["image"],
-            sample["reference"],
+            ref_emb,
             settings={"max_objects": DEFAULT_MAX_OBJECTS},
         )
         objs = result["objects"]
