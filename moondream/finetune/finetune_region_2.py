@@ -79,21 +79,6 @@ def region_loss(
     return c_loss + s_loss
 
 
-def region_loss(hidden_states, w, labels, c_idx, s_idx):
-    l_idx = torch.arange(len(labels))
-    c_idx = c_idx - 1
-    c_hidden = hidden_states[:, c_idx, :]
-    c_logits = decode_coordinate(c_hidden, w)
-    c_labels = labels[(l_idx % 4) < 2]
-    c_loss = F.cross_entropy(c_logits.view(-1, c_logits.size(-1)), c_labels)
-    s_idx = s_idx - 1
-    s_hidden = hidden_states[:, s_idx, :]
-    s_logits = decode_size(s_hidden, w).view(-1, 1024)
-    s_labels = labels[(l_idx % 4) >= 2]
-    s_loss = F.cross_entropy(s_logits, s_labels)
-    return c_loss + s_loss
-
-
 def compute_iou(box1, box2):
     # box: [x_min, y_min, x_max, y_max]
     xA = max(box1[0], box2[0])
@@ -143,19 +128,19 @@ def compute_map(preds, gts, iou_threshold=0.5):
         return torch.tensor(box_list)
 
     all_precisions = []
-    for pred_raw, true_tensor in zip(preds, gts):
+    for pred_raw, true_raw in zip(preds, gts):
         pred_tensor = to_tensor(pred_raw)
-        true_boxes = true_tensor.detach().cpu().tolist()
+        true_tensor = to_tensor(true_raw)
+
         pred_boxes = pred_tensor.tolist()
+        true_boxes = true_tensor.tolist()
 
         matched = set()
         tp = 0
         for pb in pred_boxes:
-            # find best matching gt
             best_iou, best_j = 0, -1
             for j, tb in enumerate(true_boxes):
-                if j in matched:
-                    continue
+                if j in matched: continue
                 iou = compute_iou(pb, tb)
                 if iou > best_iou:
                     best_iou, best_j = iou, j
@@ -174,131 +159,137 @@ def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
     first_idx = eval_idxs[0]
-
+    
     # grab the precomputed prefix / suffix id lists from your tokenizer
-    prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
-    suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
+    with torch.no_grad():
+        prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+        suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
-    # 1) text‐encode the prefix and suffix (they’re fixed)
-    prefix_emb = text_encoder(
-        torch.tensor([prefix_ids], device=model.device),
-        model.text,
-    )  # [1, prefix_len, D]
+        prefix_emb = text_encoder(
+            torch.tensor([prefix_ids], device=device),
+            model.text,
+        )  # Shape: [1, prefix_len, D]
 
-    suffix_emb = text_encoder(
-        torch.tensor([suffix_ids], device=model.device),
-        model.text,
-    )  # [1, suffix_len, D]
-        
+        suffix_emb = text_encoder(
+            torch.tensor([suffix_ids], device=device),
+            model.text,
+        )  # Shape: [1, suffix_len, D]
+
+        bos_emb = text_encoder(
+            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
+            model.text,
+        ) # Shape: [1, 1, D]
+
     for idx in eval_idxs:
         sample = dataset[idx]
 
-        # --- exactly like model.detect() for the scene image ---
-        enc_img = model.encode_image(sample["image"])
-        model.load_encoded_image(enc_img)
+        with torch.no_grad():
+            img_emb_flat = model._run_vision_encoder(sample["image"])      # [D]
+            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # [D]
+            img_emb = img_emb_flat.to(device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
+            ref_emb = ref_emb_flat.to(device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
 
-        # 2) project the reference image into a single [1,1,D] token
-        ref_emb = model._run_vision_encoder(sample["reference"])[None]  # [1,1,D]
+            # 2. Construct Full Prompt Embedding (Mirrors Training Order)
+            # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
+            full_prompt_emb = torch.cat([
+                bos_emb, prefix_emb, ref_emb, suffix_emb
+            ], dim=1)
+            total_prompt_len = full_prompt_emb.size(1)
 
-        # 3) concatenate exactly in the same order detect() would:
-        #    [PREFIX TEXT] [REF TOKEN] [SUFFIX TEXT]
-        #    Note: detect() normally does [BOS] implicitly via prefix, so omit BOS.
-        inputs = torch.cat([prefix_emb, ref_emb, suffix_emb], dim=1)
-        seq_len = inputs.size(1)
+            # 3. Manual Forward Pass through Transformer (Replaces _prefill_prompt)
+            # --- Reset KV Cache ---
+            if hasattr(model.text, 'blocks') and model.text.blocks:
+                for block in model.text.blocks:
+                     if hasattr(block, 'kv_cache') and block.kv_cache is not None:
+                         if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache.zero_()
+                         if hasattr(block.kv_cache, 'v_cache'): block.kv_cache.v_cache.zero_()
 
-        # 4) prefill and slice off the last hidden (same as detect())
-        _, hidden, next_token, pos = model._prefill_prompt(
-            # we feed the *ids* of the prefix+suffix only into prefill;
-            # the ref_emb is already “baked into” inputs_embeds
-            torch.tensor([prefix_ids + suffix_ids], device=model.device),
-            enc_img.pos,
-            temperature=0,
-            top_p=0,
-        )
-        last_hidden = hidden[:, -1:, :]  # [1,1,D]
+            # --- Manual Transformer Forward Pass ---
+            hidden_states = full_prompt_emb
+            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
+            for block in model.text.blocks:
+                 block_output = block(
+                     hidden_states,
+                     use_cache=True,
+                     position_ids=position_ids[:, :hidden_states.size(1)],
+                 )
+                 hidden_states = block_output[0]
 
-        # 5) generate region tokens
-        objs = model._generate_points(
-            last_hidden, next_token, pos, include_size=True,
-            max_objects=DEFAULT_MAX_OBJECTS
-        )
+            hidden_states = model.text.norm(hidden_states)
+            last_hidden = hidden_states[:, -1:, :] # State after full prompt
+
+            # --- Predict Initial Token for Generation ---
+            next_logits = model.text.lm_head(last_hidden)
+            initial_next_token_id = torch.argmax(next_logits, dim=-1)
+
+            # 4. Generate Region Points (Replaces original call)
+            gen_pos = total_prompt_len # Start generation after the prompt
+            objs = model._generate_points(
+                last_hidden,
+                next_token=initial_next_token_id, # Use predicted token
+                pos=gen_pos,
+                include_size=True,
+                max_objects=DEFAULT_MAX_OBJECTS
+            )
+
+        # --- Ground Truth Processing (Same as your corrected version) ---
+        gt_boxes = []
+        for box_data in sample["boxes"].detach().cpu().tolist():
+             x_min_n, y_min_n, w_n, h_n = box_data
+             x_max_n = x_min_n + w_n
+             y_max_n = y_min_n + h_n
+             x_min_n = max(0.0, min(1.0, x_min_n))
+             y_min_n = max(0.0, min(1.0, y_min_n))
+             x_max_n = max(0.0, min(1.0, x_max_n))
+             y_max_n = max(0.0, min(1.0, y_max_n))
+             gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n]) # Format for compute_map
 
         preds.append(objs)
-        gts.append(sample["boxes"])
+        gts.append(gt_boxes)
 
-        # draw the very first eval sample
+        # --- Visualization (Same as your corrected version) ---
         if idx == first_idx:
+            # Use .get for safer access to class_names
+            sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
+            print(f"\nRUNNING EVAL (Replacement) for class placeholder: `{sample_class}`")
+            print("RESULT", str(objs))
+            print(f"EXPECTED (norm xywh): {sample['boxes']}")
+
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
-            for o in objs:
-                draw.rectangle(
-                    [o["x_min"], o["y_min"], o["x_max"], o["y_max"]],
-                    outline="red", width=2
-                )
+            w_img, h_img = vis.size
+
+            for o in objs: # Draw Predictions (Red)
+                x0 = max(0.0, min(1.0, o["x_min"])) * w_img
+                y0 = max(0.0, min(1.0, o["y_min"])) * h_img
+                x1 = max(0.0, min(1.0, o["x_max"])) * w_img
+                y1 = max(0.0, min(1.0, o["y_max"])) * h_img
+                draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
+
+            for bb in sample["boxes"]: # Draw Ground Truth (Green)
+                x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
+                x_min_px = x_min_n * w_img
+                y_min_px = y_min_n * h_img
+                x_max_px = (x_min_n + width_n) * w_img
+                y_max_px = (y_min_n + height_n) * h_img
+                x_min_px = max(0, min(w_img - 1, x_min_px))
+                y_min_px = max(0, min(h_img - 1, y_min_px))
+                x_max_px = max(0, min(w_img - 1, x_max_px))
+                y_max_px = max(0, min(h_img - 1, y_max_px))
+                draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
+
+            # Log to wandb (same logic, potentially update key)
             wandb.log({
-                "eval/example_detect_inline":
-                    wandb.Image(vis, caption="Inline-REF predictions")
+                "eval/example_detect_replacement": # Consider a new key
+                    wandb.Image(vis, caption="Detect via Inline Ref (Replacement Eval)")
             })
 
+    # --- Return mAP (Same as original) ---
+    # Add basic check for empty lists before calling compute_map
+    if not preds or not gts:
+        print("Warning: No predictions or ground truths to compute mAP.")
+        return 0.0
     return compute_map(preds, gts)
-
-
-class WasteDetection(Dataset):
-    def __init__(self, split: str = "train"):
-        self.dataset: datasets.Dataset = datasets.load_dataset(
-            "moondream/waste_detection", split=split
-        )
-        self.dataset = self.dataset.shuffle(seed=111)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        row = self.dataset[idx]
-        image = row["image"]
-        boxes = row["boxes"]
-        labels = row["labels"]
-
-        objects = {}
-        for box, label in zip(boxes, labels):
-            objects.setdefault(label, []).append(box)
-
-        flat_boxes = []
-        class_names = []
-        for label, box_list in objects.items():
-            for b in box_list:
-                flat_boxes.append(b)
-                class_names.append(label)
-
-        flat_boxes = torch.as_tensor(flat_boxes, dtype=torch.float16)
-        image_id = torch.tensor([idx], dtype=torch.int64)
-
-        return {
-            "image": image,
-            "boxes": flat_boxes,
-            "class_names": class_names,
-            "image_id": image_id,
-        }
-
-
-def to_yolo_format(img_width, img_height, bbox):
-    x_min, y_min, x_max, y_max = bbox
-
-    # 1) Compute center (in pixels)
-    x_center = (x_min + x_max) / 2.0
-    y_center = (y_min + y_max) / 2.0
-
-    # 2) Compute width/height (in pixels)
-    box_w = x_max - x_min
-    box_h = y_max - y_min
-
-    # 3) Normalize by image size
-    x_center_norm = x_center / img_width
-    y_center_norm = y_center / img_height
-    w_norm = box_w / img_width
-    h_norm = box_h / img_height
-
-    return [x_center_norm, y_center_norm, w_norm, h_norm]
 
 
 def collate_references(ref_images):
@@ -360,16 +351,28 @@ class GroundedDetection(Dataset):
         bboxes = row["bboxes"]
         labels = [row["asset_name"] for _ in row["bboxes"]]
 
-        # convert to YOLO format
+        # convert pixel [xmin, ymin, xmax, ymax] to normalized [xmin, ymin, width, height]
         norm_boxes = []
+        w_img, h_img = image.size
         for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox
-            w_img, h_img = image.size
-            x_c = (x_min + x_max) / 2 / w_img
-            y_c = (y_min + y_max) / 2 / h_img
-            w_n = (x_max - x_min) / w_img
-            h_n = (y_max - y_min) / h_img
-            norm_boxes.append([x_c, y_c, w_n, h_n])
+            x_min_px, y_min_px, x_max_px, y_max_px = bbox
+
+            # Calculate normalized top-left corner
+            x_min_norm = x_min_px / w_img
+            y_min_norm = y_min_px / h_img
+
+            # Calculate normalized width and height
+            width_norm = (x_max_px - x_min_px) / w_img
+            height_norm = (y_max_px - y_min_px) / h_img
+
+            # Optional: Clamp values to [0.0, 1.0] to avoid numerical issues
+            x_min_norm = max(0.0, min(1.0, x_min_norm))
+            y_min_norm = max(0.0, min(1.0, y_min_norm))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            # Append in the correct [x_min, y_min, width, height] format
+            norm_boxes.append([x_min_norm, y_min_norm, width_norm, height_norm])
 
         # group by label
         objects = {}
@@ -463,7 +466,7 @@ def main():
             random.shuffle(train_idxs)
             
         frac_class_epoch = 0.8 * (1 - epoch / (EPOCHS - 1))
-        wandb.log({"frac_class_epoch": frac_class_epoch}, step=epoch)
+        wandb.log({"frac_class_epoch": frac_class_epoch})
         
         for sample_idx in train_idxs:
             sample = dataset[sample_idx]
