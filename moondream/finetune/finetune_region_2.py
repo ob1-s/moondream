@@ -189,6 +189,12 @@ def eval_detect_inline(dataset, eval_idxs, model):
             img_emb = img_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
             ref_emb = ref_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
 
+            print(f"bos_emb shape: {bos_emb.shape}")
+            print(f"img_emb shape: {img_emb.shape}")
+            print(f"prefix_emb shape: {prefix_emb.shape}")
+            print(f"ref_emb shape: {ref_emb.shape}")
+            print(f"suffix_emb shape: {suffix_emb.shape}")
+            
             # 2. Construct Full Prompt Embedding (Mirrors Training Order)
             # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
             full_prompt_emb = torch.cat([
