@@ -79,19 +79,19 @@ def region_loss(
     return c_loss + s_loss
 
 
-def region_loss(hidden_states, w, labels, c_idx, s_idx):
-    l_idx = torch.arange(len(labels))
-    c_idx = c_idx - 1
-    c_hidden = hidden_states[:, c_idx, :]
-    c_logits = decode_coordinate(c_hidden, w)
-    c_labels = labels[(l_idx % 4) < 2]
-    c_loss = F.cross_entropy(c_logits.view(-1, c_logits.size(-1)), c_labels)
-    s_idx = s_idx - 1
-    s_hidden = hidden_states[:, s_idx, :]
-    s_logits = decode_size(s_hidden, w).view(-1, 1024)
-    s_labels = labels[(l_idx % 4) >= 2]
-    s_loss = F.cross_entropy(s_logits, s_labels)
-    return c_loss + s_loss
+def compute_iou(box1, box2):
+    # box: [x_min, y_min, x_max, y_max]
+    xA = max(box1[0], box2[0])
+    yA = max(box1[1], box2[1])
+    xB = min(box1[2], box2[2])
+    yB = min(box1[3], box2[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    inter = interW * interH
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0.0
 
 
 def compute_iou(box1, box2):
@@ -143,19 +143,19 @@ def compute_map(preds, gts, iou_threshold=0.5):
         return torch.tensor(box_list)
 
     all_precisions = []
-    for pred_raw, true_tensor in zip(preds, gts):
+    for pred_raw, true_raw in zip(preds, gts):
         pred_tensor = to_tensor(pred_raw)
-        true_boxes = true_tensor.detach().cpu().tolist()
+        true_tensor = to_tensor(true_raw)
+
         pred_boxes = pred_tensor.tolist()
+        true_boxes = true_tensor.tolist()
 
         matched = set()
         tp = 0
         for pb in pred_boxes:
-            # find best matching gt
             best_iou, best_j = 0, -1
             for j, tb in enumerate(true_boxes):
-                if j in matched:
-                    continue
+                if j in matched: continue
                 iou = compute_iou(pb, tb)
                 if iou > best_iou:
                     best_iou, best_j = iou, j
@@ -186,17 +186,61 @@ def eval_detect_ref(dataset, eval_idxs, model):
         )
         objs = result["objects"]  # list of {x_min, y_min, x_max, y_max}
 
-        preds.append(objs)
-        gts.append(sample["boxes"])
+        gt_boxes = []
+        # sample["boxes"] is now normalized [x_min, y_min, width, height]
+        for x_min_n, y_min_n, w_n, h_n in sample["boxes"].detach().cpu().tolist():
+             # Convert to normalized [x_min, y_min, x_max, y_max] for mAP calculation
+             # (Assuming model.detect outputs this format and compute_iou expects it)
+             x_max_n = x_min_n + w_n
+             y_max_n = y_min_n + h_n
+             # Clamp to be safe, although clamping in __getitem__ might be sufficient
+             x_min_n = max(0.0, min(1.0, x_min_n))
+             y_min_n = max(0.0, min(1.0, y_min_n))
+             x_max_n = max(0.0, min(1.0, x_max_n))
+             y_max_n = max(0.0, min(1.0, y_max_n))
+             gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n])
+        
+        preds.append(objs)      # objs is already a list of dicts with normalized corners
+        gts.append(gt_boxes)    # now a list of 4‑floats matching the preds format
 
         # 2) on the very first eval sample, draw & log its predictions
-        if idx == first_idx:
-            vis = sample["image"].convert("RGB").copy()
-            draw = ImageDraw.Draw(vis)
-            for o in objs:
+        for o in objs:
+                # normalized coords:
+                x_min_n, y_min_n = o["x_min"], o["y_min"]
+                x_max_n, y_max_n = o["x_max"], o["y_max"]
+            
+                # convert to pixels
+                x0 = x_min_n * w_img
+                y0 = y_min_n * h_img
+                x1 = x_max_n * w_img
+                y1 = y_max_n * h_img
+            
                 draw.rectangle(
-                    [o["x_min"], o["y_min"], o["x_max"], o["y_max"]],
+                    [x0, y0, x1, y1],
                     outline="red",
+                    width=2,
+                )
+            
+            # Draw Ground Truth boxes (Green) - CORRECTED
+            for bb in sample["boxes"]:
+                # bb is now [x_min_n, y_min_n, width_n, height_n]
+                x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
+
+                # Convert normalized [xmin, ymin, width, height] to pixel [xmin, ymin, xmax, ymax]
+                x_min_px = x_min_n * w_img
+                y_min_px = y_min_n * h_img
+                x_max_px = (x_min_n + width_n) * w_img
+                y_max_px = (y_min_n + height_n) * h_img
+
+                # Optional: Clamp pixel coordinates to image boundaries for robustness
+                x_min_px = max(0, min(w_img - 1, x_min_px))
+                y_min_px = max(0, min(h_img - 1, y_min_px))
+                x_max_px = max(0, min(w_img - 1, x_max_px))
+                y_max_px = max(0, min(h_img - 1, y_max_px))
+
+                draw.rectangle(
+                    [x_min_px, y_min_px, x_max_px, y_max_px],
+                    outline="green",
                     width=2,
                 )
             wandb.log({
@@ -205,64 +249,6 @@ def eval_detect_ref(dataset, eval_idxs, model):
             })
 
     return compute_map(preds, gts)
-
-
-class WasteDetection(Dataset):
-    def __init__(self, split: str = "train"):
-        self.dataset: datasets.Dataset = datasets.load_dataset(
-            "moondream/waste_detection", split=split
-        )
-        self.dataset = self.dataset.shuffle(seed=111)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        row = self.dataset[idx]
-        image = row["image"]
-        boxes = row["boxes"]
-        labels = row["labels"]
-
-        objects = {}
-        for box, label in zip(boxes, labels):
-            objects.setdefault(label, []).append(box)
-
-        flat_boxes = []
-        class_names = []
-        for label, box_list in objects.items():
-            for b in box_list:
-                flat_boxes.append(b)
-                class_names.append(label)
-
-        flat_boxes = torch.as_tensor(flat_boxes, dtype=torch.float16)
-        image_id = torch.tensor([idx], dtype=torch.int64)
-
-        return {
-            "image": image,
-            "boxes": flat_boxes,
-            "class_names": class_names,
-            "image_id": image_id,
-        }
-
-
-def to_yolo_format(img_width, img_height, bbox):
-    x_min, y_min, x_max, y_max = bbox
-
-    # 1) Compute center (in pixels)
-    x_center = (x_min + x_max) / 2.0
-    y_center = (y_min + y_max) / 2.0
-
-    # 2) Compute width/height (in pixels)
-    box_w = x_max - x_min
-    box_h = y_max - y_min
-
-    # 3) Normalize by image size
-    x_center_norm = x_center / img_width
-    y_center_norm = y_center / img_height
-    w_norm = box_w / img_width
-    h_norm = box_h / img_height
-
-    return [x_center_norm, y_center_norm, w_norm, h_norm]
 
 
 def collate_references(ref_images):
@@ -324,16 +310,22 @@ class GroundedDetection(Dataset):
         bboxes = row["bboxes"]
         labels = [row["asset_name"] for _ in row["bboxes"]]
 
-        # convert to YOLO format
-        norm_boxes = []
-        for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox
-            w_img, h_img = image.size
-            x_c = (x_min + x_max) / 2 / w_img
-            y_c = (y_min + y_max) / 2 / h_img
-            w_n = (x_max - x_min) / w_img
-            h_n = (y_max - y_min) / h_img
-            norm_boxes.append([x_c, y_c, w_n, h_n])
+        # Calculate normalized top-left corner
+            x_min_norm = x_min_px / w_img
+            y_min_norm = y_min_px / h_img
+
+            # Calculate normalized width and height
+            width_norm = (x_max_px - x_min_px) / w_img
+            height_norm = (y_max_px - y_min_px) / h_img
+
+            # Optional: Clamp values to [0.0, 1.0] to avoid numerical issues
+            x_min_norm = max(0.0, min(1.0, x_min_norm))
+            y_min_norm = max(0.0, min(1.0, y_min_norm))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            # Append in the correct [x_min, y_min, width, height] format
+            norm_boxes.append([x_min_norm, y_min_norm, width_norm, height_norm])
 
         # group by label
         objects = {}
