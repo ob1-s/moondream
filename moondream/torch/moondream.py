@@ -486,7 +486,6 @@ class MoondreamModel(nn.Module):
 
         return out
 
-    
     def detect_with_inline_reference(
         self,
         image: Union[Image.Image, EncodedImage],
@@ -556,10 +555,17 @@ class MoondreamModel(nn.Module):
 
         # Calculate attention mask and position IDs for this new prompt part
         prompt_len = prompt_emb.size(1)
-        # The mask needs to cover from `pos` to `pos + prompt_len`
-        # self.attn_mask shape is [1, 1, max_ctx, max_ctx]
-        mask = self.attn_mask[:, :, pos : pos + prompt_len, : pos + prompt_len] # Use causal mask for this part too
+
+        # CORRECTED MASK CALCULATION:
+        # The mask needs Tq=prompt_len rows and Ts=max_context columns
+        # Slice rows for current queries (pos to pos+prompt_len)
+        # Slice columns for all possible keys (0 to max_context) to match KV cache shape.
+        # The precomputed self.attn_mask handles causality and vision prefix within this slice.
+        mask = self.attn_mask[:, :, pos : pos + prompt_len, : self.config.text.max_context]
+        # Expected shape: [1, 1, prompt_len, max_context] e.g. [1, 1, 735, 2048]
+
         pos_ids = torch.arange(pos, pos + prompt_len, dtype=torch.long, device=self.device)
+
 
         with torch.inference_mode():
             # Process the prompt embedding using _prefill, updating the KV cache
