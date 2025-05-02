@@ -155,138 +155,53 @@ def compute_map(preds, gts, iou_threshold=0.5):
     return sum(all_precisions) / len(all_precisions) if all_precisions else 0.0
 
 
-def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel):
+def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
-    if not eval_idxs: return 0.0
     first_idx = eval_idxs[0]
-    device = model.device
 
     # grab the precomputed prefix / suffix id lists from your tokenizer
     with torch.no_grad():
-        try:
-            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"] + [220]
-            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-        except KeyError:
-            print("Warning: Using fallback 'detect' template.")
-            prefix_ids = model.tokenizer.encode("\n\nDetect:").ids + [220]
-            suffix_ids = model.tokenizer.encode("\n\n").ids
+        prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+        suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
         prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=device),
-            model.text,
-        )
-
-        suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=device),
-            model.text,
-        )
-
-        bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
-            model.text,
-        )
-
-    for idx in eval_idxs:
-        sample = dataset[idx]
-        if sample is None or "` argument.
-
-
-def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type hint for clarity
-    model.eval()
-    preds, gts = [], []
-    if not eval_idxs: return 0.0 # Handle empty list early
-    first_idx = eval_idxs[0]
-    device = model.device # Use model's device consistently
-
-    # grab the precomputed prefix / suffix id lists from your tokenizer
-    with torch.no_grad():
-        # Use try-except for robustness against missing templates
-        try:
-            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"] + [220] # Add leading space if needed
-            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-        except KeyError:
-            print("Warning: Using fallback 'detect' template.")
-            prefix_ids = model.tokenizer.encode("\n\nDetect:").ids + [220]
-            suffix_ids = model.tokenizer.encode("\n\n").ids
-
-        prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=device),
+            torch.tensor([prefix_ids], device=model.device),
             model.text,
         )  # Shape: [1, prefix_len, D]
 
         suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=device),
+            torch.tensor([suffix_ids], device=model.device),
             model.text,
         )  # Shape: [1, suffix_len, D]
 
         bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
+            torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
             model.text,
         ) # Shape: [1, 1, D]
 
-    for idx in eval_idxs: # Consider adding tqdm(eval_idxs) if you want progress bar
+    for idx in eval_idxs:
         sample = dataset[idx]
-        # Basic check for sample validity
-        if sample is None or "image" not in sample or "reference" not in sample or "boxes" not in sample:
-            continue # Skip invalid samples
 
         with torch.no_grad():
-            # 1. Get Scene and Reference Embeddings
             img_emb_flat = model._run_vision_encoder(sample["image"])      # Expected [729, D]
             ref_emb_flat = model._run_vision_encoder(sample["reference"])  # Expected [729, D]
-            # Reshape to [1, SeqLen, D] and ensure on correct device
-            img_emb = img_emb_flat.to(device).unsqueeze(0)    # Shape: [1, 729, D]
-            ref_emb = ref_emb_flat.to(device).unsqueeze(0)    # Shape: [1, 729, D]
+            # --- START FIX ---
+            # Change .unsqueeze(0).unsqueeze(0) to .unsqueeze(0) to match training [None]
+            img_emb = img_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
+            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
+            # --- END FIX ---
 
-
-            # 2. Construct Full Prompt Embedding (Mirrors Training Order)image" not in sample or "reference" not in sample or "boxes" not in sample:
-            continue
-
-        with torch.no_grad():
-            img_emb_flat = model._run_vision_encoder(sample["image"])
-            ref_emb_flat = model._run_vision_encoder(sample["reference"])
-            img_emb = img_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
-            ref_emb = ref_emb_flat.to(device).unsqueeze(0) # Shape: [1, 729, D]
-
-            # 2. Construct Full Prompt Embedding
-            full_prompt_emb = torch.cat([
-                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb
-            ], dim=1)
-            total_prompt_len = full_prompt_emb.size(1)
-
-            # 3. Manual Forward Pass
-            # --- Reset KV Cache ---
-            if hasattr(model.text, 'blocks') and model.text.blocks:
-                for block in model.text.blocks:
-                     if hasattr(block, 'kv_cache') and block.kv_cache is not None:
-                         if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache
+            # 2. Construct Full Prompt Embedding (Mirrors Training Order)
             # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
             full_prompt_emb = torch.cat([
-                bos_emb,    # [1, 1, D]
-                img_emb,    # [1, 729, D]
-                prefix_emb, # [1, prefix_len, D]
-                ref_emb,    # [1, 729, D]
-                suffix_emb  # [1, suffix_len, D]
-            ], dim=1)
-            total_prompt_len = full_prompt_emb.size(1)
+                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb # Now all are 3D
+            ], dim=1) # Concatenates along sequence dim
+            total_prompt_len = full_prompt_emb.size(1) # Now = 1 + 729 + prefix_len + 729 + suffix_len
 
             # 3. Manual Forward Pass through Transformer (Replaces _prefill_prompt)
             # --- Reset KV Cache ---
-            if.zero_()
-                         if hasattr(block.kv_cache, 'v_cache'): block.kv_cache.v_cache.zero_()
-
-            # --- Manual Transformer Forward Pass ---
-            hidden_states = full_prompt_emb
-            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
-            for block in model.text.blocks:
-                 # --- START FIX ---
-                 # Remove use_cache=True argument
-                 block_output = block(
-                     hidden_states,
-                     position_ids=position_ids[:, :hidden_states.size(1)],
-                 )
-                 # --- hasattr(model.text, 'blocks') and model.text.blocks:
+            if hasattr(model.text, 'blocks') and model.text.blocks:
                 for block in model.text.blocks:
                      if hasattr(block, 'kv_cache') and block.kv_cache is not None:
                          if hasattr(block.kv_cache, 'k_cache'): block.kv_cache.k_cache.zero_()
@@ -294,72 +209,45 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type 
 
             # --- Manual Transformer Forward Pass ---
             hidden_states = full_prompt_emb
-            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
+            # Position IDs should match the total sequence length
+            position_ids = torch.arange(0, total_prompt_len, device=model.device).unsqueeze(0)
             for block in model.text.blocks:
-                 # --- START FIX ---
-                 # Remove the unexpected keyword argument 'use_cache'
                  block_output = block(
                      hidden_states,
-                      END FIX ---
-                 hidden_states = block_output[0] # Assume output is tuple (hidden_state, kv_cache) or just hidden_state
-
-            hidden_states = model.text.norm(hidden_states)
-            last_hidden = hidden_states[:, -1:, :]
-
-            # --- Predict Initial Token ---
-            next_logits = model.text.lm_head(last_hidden)
-            initial_next_token_id =# use_cache=True, # REMOVE THIS ARGUMENT
+                     # Pass position IDs relevant to the current hidden_states length
                      position_ids=position_ids[:, :hidden_states.size(1)],
                  )
-                 # --- END FIX ---
-                 hidden_states = block_output[0] # Get the hidden states
+                 hidden_states = block_output[0]
 
-            hidden_states = model.text.norm(hidden_states) # Apply final norm
-            last_hidden = hidden_states[:, -1:, :] # State after full prompt
+            hidden_states = model.text.norm(hidden_states)
+            # last_hidden is state after the *last token* of the full prompt
+            last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
 
-            # torch.argmax(next_logits, dim=-1)
-
-            # 4. Generate Region Points
-            gen_pos = total_prompt_len
-            objs = model._generate_points(
-                last_hidden,
-                next --- Predict Initial Token for Generation ---
-            next_logits = model.text.lm_head(last_hidden_token=initial_next_token_id,
-                pos=gen_pos,
-                include_size=True,
-                max_objects=DEFAULT_MAX_OBJECTS
-            )
-
-        # --- Ground Truth Processing (Rem)
+            # --- Predict Initial Token for Generation ---
+            next_logits = model.text.lm_head(last_hidden)
             initial_next_token_id = torch.argmax(next_logits, dim=-1)
 
             # 4. Generate Region Points (Replaces original call)
-            gen_pos = total_prompt_ains the same) ---
-        gt_boxes = []
-        for box_data in sample["boxes"].detach().cpu().tolist():
-             x_min_n, y_min_n, w_n, hlen # Start generation after the prompt
+            # Generation starts *after* the full prompt sequence
+            gen_pos = total_prompt_len
             objs = model._generate_points(
                 last_hidden,
                 next_token=initial_next_token_id, # Use predicted token
-                pos=gen_pos_n = box_data
-             x_max_n = x_min_n + w_n
-             y_max_n = y_min_n + h_n
-             x_min_n =,
+                pos=gen_pos,
                 include_size=True,
                 max_objects=DEFAULT_MAX_OBJECTS
             )
 
         # --- Ground Truth Processing (Remains the same) ---
         gt_boxes = []
-        for max(0.0, min(1.0, x_min_n))
-             y_min_n = max(0.0, min(1.0, y_min_n))
-             x_ box_data in sample["boxes"].detach().cpu().tolist():
+        for box_data in sample["boxes"].detach().cpu().tolist():
              x_min_n, y_min_n, w_n, h_n = box_data
-             x_max_n = xmax_n = max(0.0, min(1.0, x_max_n))
-             y_max_n = max(0.0, min(1.0, y_max_n))_min_n + w_n
+             x_max_n = x_min_n + w_n
              y_max_n = y_min_n + h_n
              x_min_n = max(0.0, min(1.0, x_min_n))
-             y_min_n = max(0.0, min(1.0, y
+             y_min_n = max(0.0, min(1.0, y_min_n))
+             x_max_n = max(0.0, min(1.0, x_max_n))
+             y_max_n = max(0.0, min(1.0, y_max_n))
              gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n])
 
         preds.append(objs)
@@ -367,76 +255,42 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type 
 
         # --- Visualization (Remains the same) ---
         if idx == first_idx:
-            sample_min_n))
-             x_max_n = max(0.0, min(1.0, x_max_n))
-             y_max_n = max(0.0, min(1.0, y_max_n))
-             gt_boxes.append([x_min_n, y_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
-            print(f"\nRUNNING EVAL (Corrected use_cache) for class placeholder: `{sample_class}`") # Updated print
+            sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
+            print(f"\nRUNNING EVAL (Corrected Dim) for class placeholder: `{sample_class}`")
             print("RESULT", str(objs))
-            print(f"EXPECTED (norm xywh_min_n, x_max_n, y_max_n])
-
-        preds.append(objs)
-        gts.append(gt_boxes)
-
-        # --- Visualization (Remains the same) ---
-        if idx == first_idx:
-            sample_class = sample.get("class_names", ["): {sample['boxes']}")
+            print(f"EXPECTED (norm xywh): {sample['boxes']}")
 
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
             w_img, h_img = vis.size
 
             for o in objs: # Draw Predictions (Red)
-                x0 = max(0.0, min(1.0, ounknown"])[0].replace('-', ' ')
-            print(f"\nRUNNING EVAL (Corrected use_cache) for class placeholder: `{sample_class}`") # Updated print
-            print("RESULT", str(objs))
-            print(f"EXPECTED (norm xywh): {sample['boxes']}")
-
-            vis = sample["image"].["x_min"])) * w_img
-                y0 = max(0.0, min(1.0, o["y_min"])) * h_img
-                x1 = max(0.0, min(1.0, o["x_max"])) * w_img
-                y1 = max(0.convert("RGB").copy()
-            draw = ImageDraw.Draw(vis)
-            w_img, h0, min(1.0, o["y_max"])) * h_img
-                draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
-
-            for bb_img = vis.size
-
-            for o in objs: # Draw Predictions (Red)
                 x0 = max(0.0, min(1.0, o["x_min"])) * w_img
-                y0 = max(0.0, min(1.0, o["y_min"])) * h_ in sample["boxes"]: # Draw Ground Truth (Green)
-                x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
-                x_min_img
+                y0 = max(0.0, min(1.0, o["y_min"])) * h_img
                 x1 = max(0.0, min(1.0, o["x_max"])) * w_img
                 y1 = max(0.0, min(1.0, o["y_max"])) * h_img
                 draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
 
-            for bb in sample["boxes"]: # Draw Ground Truth (Greenpx = x_min_n * w_img
-                y_min_px = y_min_n * h_img
-                x_max_px = (x_min_n + width_n) * w_img
-                y_max_px = (y_min_n + height_n) * h_img
-                x_min_px = max(0, min(w_img - 1, x)
+            for bb in sample["boxes"]: # Draw Ground Truth (Green)
                 x_min_n, y_min_n, width_n, height_n = bb.detach().cpu().tolist()
-                x_min_px = x_min_n * w_img_min_px))
-                y_min_px = max(0, min(h_img - 1, y_min_px))
-                x_max_px = max(0, min(w_img - 1, x_max_px))
-                y_max_px = max(0, min
+                x_min_px = x_min_n * w_img
                 y_min_px = y_min_n * h_img
                 x_max_px = (x_min_n + width_n) * w_img
                 y_max_px = (y_min_n + height_n) * h_img
                 x_min_px = max(0, min(w_img - 1, x_min_px))
                 y_min_px = max(0, min(h_img - 1, y_min_px))
-                x(h_img - 1, y_max_px))
+                x_max_px = max(0, min(w_img - 1, x_max_px))
+                y_max_px = max(0, min(h_img - 1, y_max_px))
                 draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
 
             wandb.log({
-                "eval/example_detect_corrected_use_cache": # Updated key
-                    wandb.Image(vis, caption="Detect via Inline Ref (Corrected use_cache Eval)")
+                "eval/example_detect_corrected_dim": # Updated key
+                    wandb.Image(vis, caption="Detect via Inline Ref (Corrected Dim Eval)")
             })
 
     # --- Return mAP (Remains the same) ---
-    if not preds or_max_px = max(0, min(w_img - 1, x_max_px))
-                y_max_px = max(0, min(h_img - 1, y_max not gts:
+    if not preds or not gts:
+        # print("Warning: No predictions or ground truths to compute mAP.") # Optional
         return 0.0
     return compute_map(preds, gts)
                                
