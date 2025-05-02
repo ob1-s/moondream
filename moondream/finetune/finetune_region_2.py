@@ -463,6 +463,7 @@ def main():
             random.shuffle(train_idxs)
             
         frac_class_epoch = 0.8 * (1 - epoch / (EPOCHS - 1))
+        wandb.log({"frac_class_epoch": frac_class_epoch}, step=epoch)
         
         for sample_idx in train_idxs:
             sample = dataset[sample_idx]
