@@ -158,7 +158,7 @@ def eval_detect(dataset, eval_idxs, model):
     for idx in eval_idxs:
         sample = dataset[idx]
 
-        sample_class = sample["class_names"][0].replace('-', ' '),
+        sample_class = sample["class_names"][0].replace('-', ' ')
         print(f"RUNNING EVAL for class `{sample_class}`")
 
         # 1) call the native helper instead of manual cache‐merge
