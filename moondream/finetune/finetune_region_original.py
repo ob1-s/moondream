@@ -159,7 +159,6 @@ def eval_detect(dataset, eval_idxs, model):
         sample = dataset[idx]
 
         sample_class = sample["class_names"][0].replace('-', ' ')
-        print(f"RUNNING EVAL for class `{sample_class}`")
 
         # 1) call the native helper instead of manual cache‐merge
         result = model.detect(
@@ -169,19 +168,27 @@ def eval_detect(dataset, eval_idxs, model):
         )
         objs = result["objects"]  # list of {x_min, y_min, x_max, y_max}
 
-        print("RESULT", str(objs))
-
         preds.append(objs)
         gts.append(sample["boxes"])
 
         # 2) on the very first eval sample, draw & log its predictions
         if idx == first_idx:
+            print(f"RUNNING EVAL for class `{sample_class}`")
+            print("RESULT", str(objs))
+            print(f"EXPECTED: {sample["boxes"]}")
+            
             vis = sample["image"].convert("RGB").copy()
             draw = ImageDraw.Draw(vis)
             for o in objs:
                 draw.rectangle(
                     [o["x_min"], o["y_min"], o["x_max"], o["y_max"]],
                     outline="red",
+                    width=2,
+                )
+            for _bbox in sample["boxes"]:
+                draw.rectangle(
+                    _bbox,
+                    outline="green",
                     width=2,
                 )
             wandb.log({
@@ -198,7 +205,7 @@ class GroundedDetection(Dataset):
             "oliveirabruno01/grounded-detection", split=split
         )
 
-        self.dataset = self.dataset.filter(lambda row: len(row["bboxes"]) > 0)
+        self.dataset = self.dataset.filter(lambda row: len(row["bboxes"]) == 1)
         self.dataset = self.dataset.shuffle(seed=3301)
 
     def __len__(self):
