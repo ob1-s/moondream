@@ -214,8 +214,6 @@ def eval_detect_inline(dataset, eval_idxs, model):
             for block in model.text.blocks:
                  block_output = block(
                      hidden_states,
-                     # Pass position IDs relevant to the current hidden_states length
-                     position_ids=position_ids[:, :hidden_states.size(1)],
                  )
                  hidden_states = block_output[0]
 
