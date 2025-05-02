@@ -192,7 +192,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
             # 2. Construct Full Prompt Embedding (Mirrors Training Order)
             # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
             full_prompt_emb = torch.cat([
-                bos_emb, prefix_emb, ref_emb, suffix_emb
+                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb
             ], dim=1)
             total_prompt_len = full_prompt_emb.size(1)
 
