@@ -176,10 +176,10 @@ def eval_detect_inline(dataset, eval_idxs, model):
         model.text,
     )  # [1, suffix_len, D]
 
-    HARDCODED_TEST_IMG_BASE = Image.open("./Preview.png")
-    HARDCODED_TEST_IMG_obj_1 = Image.open("./blaster-d.png")
-    HARDCODED_TEST_IMG_obj_2 = Image.open("./blaster-p.png")
-    HARDCODED_TEST_IMG_obj_3 = Image.open("./target-detail.png")
+    HARDCODED_TEST_IMG_BASE = Image.open("./moondream/finetune/Preview.png")
+    HARDCODED_TEST_IMG_obj_1 = Image.open("./moondream/finetune/blaster-d.png")
+    HARDCODED_TEST_IMG_obj_2 = Image.open("./moondream/finetune/blaster-p.png")
+    HARDCODED_TEST_IMG_obj_3 = Image.open("./moondream/finetune/target-detail.png")
 
     # RUN HARDCODED TEST
     ref_emb = model._run_vision_encoder(HARDCODED_TEST_IMG_obj_1)[None]
