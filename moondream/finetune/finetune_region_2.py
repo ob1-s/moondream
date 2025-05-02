@@ -155,61 +155,44 @@ def compute_map(preds, gts, iou_threshold=0.5):
     return sum(all_precisions) / len(all_precisions) if all_precisions else 0.0
 
 
-def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type hint for clarity
+def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
-    if not eval_idxs: return 0.0 # Handle empty list early
     first_idx = eval_idxs[0]
-    device = model.device # Use model's device consistently
-
+    
     # grab the precomputed prefix / suffix id lists from your tokenizer
     with torch.no_grad():
-        # Use try-except for robustness against missing templates
-        try:
-            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"] + [220] # Add leading space if needed
-            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-        except KeyError:
-            print("Warning: Using fallback 'detect' template.")
-            prefix_ids = model.tokenizer.encode("\n\nDetect:").ids + [220]
-            suffix_ids = model.tokenizer.encode("\n\n").ids
+        prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+        suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
 
         prefix_emb = text_encoder(
-            torch.tensor([prefix_ids], device=device),
+            torch.tensor([prefix_ids], device=model.device),
             model.text,
         )  # Shape: [1, prefix_len, D]
 
         suffix_emb = text_encoder(
-            torch.tensor([suffix_ids], device=device),
+            torch.tensor([suffix_ids], device=model.device),
             model.text,
         )  # Shape: [1, suffix_len, D]
 
         bos_emb = text_encoder(
-            torch.tensor([[model.config.tokenizer.bos_id]], device=device),
+            torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
             model.text,
         ) # Shape: [1, 1, D]
 
-    for idx in eval_idxs: # Consider adding tqdm(eval_idxs) if you want progress bar
+    for idx in eval_idxs:
         sample = dataset[idx]
-        # Basic check for sample validity
-        if sample is None or "image" not in sample or "reference" not in sample or "boxes" not in sample:
-            continue # Skip invalid samples
 
         with torch.no_grad():
-            # 1. Get Scene and Reference Embeddings
-            img_emb_flat = model._run_vision_encoder(sample["image"])      # Expected [D]
-            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # Expected [D]
-            # Reshape to [1, 1, D] and ensure on correct device
-            img_emb = img_emb_flat.to(device).unsqueeze(0).unsqueeze(0)
-            ref_emb = ref_emb_flat.to(device).unsqueeze(0).unsqueeze(0)
+            img_emb_flat = model._run_vision_encoder(sample["image"])      # [D]
+            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # [D]
+            img_emb = img_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
+            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
 
-            # 2. Construct Full Prompt Embedding (FIXED: Added img_emb)
-            # Order: [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
+            # 2. Construct Full Prompt Embedding (Mirrors Training Order)
+            # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
             full_prompt_emb = torch.cat([
-                bos_emb,    # [1, 1, D]
-                img_emb,    # [1, 1, D]  <- ADDED THIS
-                prefix_emb, # [1, prefix_len, D]
-                ref_emb,    # [1, 1, D]
-                suffix_emb  # [1, suffix_len, D]
+                bos_emb, prefix_emb, ref_emb, suffix_emb
             ], dim=1)
             total_prompt_len = full_prompt_emb.size(1)
 
@@ -223,18 +206,16 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type 
 
             # --- Manual Transformer Forward Pass ---
             hidden_states = full_prompt_emb
-            # Create position_ids for the full prompt length
-            position_ids = torch.arange(0, total_prompt_len, device=device).unsqueeze(0)
+            position_ids = torch.arange(0, total_prompt_len, device=model.device).unsqueeze(0)
             for block in model.text.blocks:
-                 # Pass the full position_ids sequence relevant to the current hidden_states
                  block_output = block(
                      hidden_states,
                      use_cache=True,
-                     position_ids=position_ids[:, :hidden_states.size(1)], # Use correct slice
+                     position_ids=position_ids[:, :hidden_states.size(1)],
                  )
-                 hidden_states = block_output[0] # Get the hidden states
+                 hidden_states = block_output[0]
 
-            hidden_states = model.text.norm(hidden_states) # Apply final norm
+            hidden_states = model.text.norm(hidden_states)
             last_hidden = hidden_states[:, -1:, :] # State after full prompt
 
             # --- Predict Initial Token for Generation ---
@@ -268,8 +249,9 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type 
 
         # --- Visualization (Same as your corrected version) ---
         if idx == first_idx:
+            # Use .get for safer access to class_names
             sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
-            print(f"\nRUNNING EVAL (Corrected) for class placeholder: `{sample_class}`") # Updated print
+            print(f"\nRUNNING EVAL (Replacement) for class placeholder: `{sample_class}`")
             print("RESULT", str(objs))
             print(f"EXPECTED (norm xywh): {sample['boxes']}")
 
@@ -296,17 +278,18 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type 
                 y_max_px = max(0, min(h_img - 1, y_max_px))
                 draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
 
-            # Log to wandb (same logic)
+            # Log to wandb (same logic, potentially update key)
             wandb.log({
-                "eval/example_detect_corrected": # Updated key
-                    wandb.Image(vis, caption="Detect via Inline Ref (Corrected Eval)")
+                "eval/example_detect_replacement": # Consider a new key
+                    wandb.Image(vis, caption="Detect via Inline Ref (Replacement Eval)")
             })
 
     # --- Return mAP (Same as original) ---
+    # Add basic check for empty lists before calling compute_map
     if not preds or not gts:
-        # Removed print warning here, keep it simple
+        print("Warning: No predictions or ground truths to compute mAP.")
         return 0.0
-    return compute_map(preds, gts) # Assumes compute_map is available
+    return compute_map(preds, gts)
 
 
 def collate_references(ref_images):
