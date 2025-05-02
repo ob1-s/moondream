@@ -191,7 +191,7 @@ def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel):
         sample = dataset[idx]
         if sample is None or "` argument.
 
-```python
+
 def eval_detect_inline(dataset, eval_idxs, model: MoondreamModel): # Added type hint for clarity
     model.eval()
     preds, gts = [], []
