@@ -168,8 +168,16 @@ def eval_detect(dataset, eval_idxs, model):
         )
         objs = result["objects"]  # list of {x_min, y_min, x_max, y_max}
 
-        preds.append(objs)
-        gts.append(sample["boxes"])
+        gt_boxes = []
+        for x_c, y_c, w_n, h_n in sample["boxes"].detach().cpu().tolist():
+            x_min = x_c - w_n / 2
+            y_min = y_c - h_n / 2
+            x_max = x_c + w_n / 2
+            y_max = y_c + h_n / 2
+            gt_boxes.append([x_min, y_min, x_max, y_max])
+        
+        preds.append(objs)      # objs is already a list of dicts with normalized corners
+        gts.append(gt_boxes)    # now a list of 4‑floats matching the preds format
 
         # 2) on the very first eval sample, draw & log its predictions
         if idx == first_idx:
