@@ -466,6 +466,10 @@ def main():
             sample = dataset[sample_idx]
             i += 1
 
+            step_in_batch = (i - 1) % GRAD_ACCUM_STEPS
+            frac_class = 1.0 - step_in_batch / GRAD_ACCUM_STEPS  # starts 1.0 → ends ~0.0
+
+
             torch.cuda.empty_cache()
 
             # 1) Compute vision embeddings for scene + reference
@@ -474,8 +478,10 @@ def main():
 
             with torch.no_grad():
                 prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]
+                prefix_ids_w_leading_space = model.config.tokenizer.templates["detect"]["prefix"]+model.tokenizer.encode(" ").ids
                 suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
                 prefix_emb = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
+                prefix_emb_w_leading_space = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
                 suffix_emb = text_encoder(torch.tensor([suffix_ids], device=model.device), model.text).squeeze(0)
 
                 # 2) Build the shared text prefix: [BOS][IMG][REF]
@@ -501,13 +507,27 @@ def main():
             total_loss = 0.0
 
             # 3) For each “class”
-            for _cls, boxes_list in boxes_by_class.items():
-
-                instruction_emb = torch.cat([
-                    prefix_emb.unsqueeze(0),   # [1, prefix_len, D]
-                    ref_emb[None],             # [1,1,D]
-                    suffix_emb.unsqueeze(0),   # [1, suffix_len, D]
-                ], dim=1)
+            for _cls, boxes_list in boxes_by_class.items():     
+                if use_class:
+                    with torch.no_grad():
+                        cls_emb = text_encoder(torch.tensor([
+                            model.tokenizer.encode(
+                                " "+_cls.replace('-', ' ')
+                            ).ids
+                        ], device=model.device), model.text).squeeze(0)  
+                    
+                    instruction_emb = torch.cat([
+                        prefix_emb.unsqueeze(0),   # [1, prefix_len, D]
+                        cls_emb.unsqueeze(0),
+                        ref_emb[None],             # [1,1,D]
+                        suffix_emb.unsqueeze(0),   # [1, suffix_len, D]
+                    ], dim=1)
+                else:
+                    instruction_emb = torch.cat([
+                        prefix_emb_w_leading_space.unsqueeze(0),   # [1, prefix_len, D]
+                        ref_emb[None],             # [1,1,D]
+                        suffix_emb.unsqueeze(0),   # [1, suffix_len, D]
+                    ], dim=1)
 
                 # Now prefix_len = base + instr_len
                 prefix_len = prefix_base + instruction_emb.size(0)
