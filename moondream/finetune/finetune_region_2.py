@@ -268,64 +268,6 @@ def eval_detect_inline(dataset, eval_idxs, model):
     return compute_map(preds, gts)
 
 
-class WasteDetection(Dataset):
-    def __init__(self, split: str = "train"):
-        self.dataset: datasets.Dataset = datasets.load_dataset(
-            "moondream/waste_detection", split=split
-        )
-        self.dataset = self.dataset.shuffle(seed=111)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        row = self.dataset[idx]
-        image = row["image"]
-        boxes = row["boxes"]
-        labels = row["labels"]
-
-        objects = {}
-        for box, label in zip(boxes, labels):
-            objects.setdefault(label, []).append(box)
-
-        flat_boxes = []
-        class_names = []
-        for label, box_list in objects.items():
-            for b in box_list:
-                flat_boxes.append(b)
-                class_names.append(label)
-
-        flat_boxes = torch.as_tensor(flat_boxes, dtype=torch.float16)
-        image_id = torch.tensor([idx], dtype=torch.int64)
-
-        return {
-            "image": image,
-            "boxes": flat_boxes,
-            "class_names": class_names,
-            "image_id": image_id,
-        }
-
-
-def to_yolo_format(img_width, img_height, bbox):
-    x_min, y_min, x_max, y_max = bbox
-
-    # 1) Compute center (in pixels)
-    x_center = (x_min + x_max) / 2.0
-    y_center = (y_min + y_max) / 2.0
-
-    # 2) Compute width/height (in pixels)
-    box_w = x_max - x_min
-    box_h = y_max - y_min
-
-    # 3) Normalize by image size
-    x_center_norm = x_center / img_width
-    y_center_norm = y_center / img_height
-    w_norm = box_w / img_width
-    h_norm = box_h / img_height
-
-    return [x_center_norm, y_center_norm, w_norm, h_norm]
-
-
 def collate_references(ref_images):
     """
     Collate a list of PIL Images (possibly RGBA) into a single prototype image
@@ -385,16 +327,28 @@ class GroundedDetection(Dataset):
         bboxes = row["bboxes"]
         labels = [row["asset_name"] for _ in row["bboxes"]]
 
-        # convert to YOLO format
+        # convert pixel [xmin, ymin, xmax, ymax] to normalized [xmin, ymin, width, height]
         norm_boxes = []
+        w_img, h_img = image.size
         for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox
-            w_img, h_img = image.size
-            x_c = (x_min + x_max) / 2 / w_img
-            y_c = (y_min + y_max) / 2 / h_img
-            w_n = (x_max - x_min) / w_img
-            h_n = (y_max - y_min) / h_img
-            norm_boxes.append([x_c, y_c, w_n, h_n])
+            x_min_px, y_min_px, x_max_px, y_max_px = bbox
+
+            # Calculate normalized top-left corner
+            x_min_norm = x_min_px / w_img
+            y_min_norm = y_min_px / h_img
+
+            # Calculate normalized width and height
+            width_norm = (x_max_px - x_min_px) / w_img
+            height_norm = (y_max_px - y_min_px) / h_img
+
+            # Optional: Clamp values to [0.0, 1.0] to avoid numerical issues
+            x_min_norm = max(0.0, min(1.0, x_min_norm))
+            y_min_norm = max(0.0, min(1.0, y_min_norm))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            # Append in the correct [x_min, y_min, width, height] format
+            norm_boxes.append([x_min_norm, y_min_norm, width_norm, height_norm])
 
         # group by label
         objects = {}
