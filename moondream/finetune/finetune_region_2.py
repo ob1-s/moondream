@@ -159,7 +159,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
     first_idx = eval_idxs[0]
-    
+
     # grab the precomputed prefix / suffix id lists from your tokenizer
     with torch.no_grad():
         prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
@@ -184,23 +184,20 @@ def eval_detect_inline(dataset, eval_idxs, model):
         sample = dataset[idx]
 
         with torch.no_grad():
-            img_emb_flat = model._run_vision_encoder(sample["image"])      # [D]
-            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # [D]
-            img_emb = img_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
-            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0).unsqueeze(0)    # [1, 1, D]
+            img_emb_flat = model._run_vision_encoder(sample["image"])      # Expected [729, D]
+            ref_emb_flat = model._run_vision_encoder(sample["reference"])  # Expected [729, D]
+            # --- START FIX ---
+            # Change .unsqueeze(0).unsqueeze(0) to .unsqueeze(0) to match training [None]
+            img_emb = img_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
+            ref_emb = ref_emb_flat.to(model.device).unsqueeze(0)    # Shape: [1, 729, D]
+            # --- END FIX ---
 
-            print(f"bos_emb shape: {bos_emb.shape}")
-            print(f"img_emb shape: {img_emb.shape}")
-            print(f"prefix_emb shape: {prefix_emb.shape}")
-            print(f"ref_emb shape: {ref_emb.shape}")
-            print(f"suffix_emb shape: {suffix_emb.shape}")
-            
             # 2. Construct Full Prompt Embedding (Mirrors Training Order)
             # [BOS] [SCENE_IMG] [PREFIX] [REF_IMG] [SUFFIX]
             full_prompt_emb = torch.cat([
-                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb
-            ], dim=1)
-            total_prompt_len = full_prompt_emb.size(1)
+                bos_emb, img_emb, prefix_emb, ref_emb, suffix_emb # Now all are 3D
+            ], dim=1) # Concatenates along sequence dim
+            total_prompt_len = full_prompt_emb.size(1) # Now = 1 + 729 + prefix_len + 729 + suffix_len
 
             # 3. Manual Forward Pass through Transformer (Replaces _prefill_prompt)
             # --- Reset KV Cache ---
@@ -212,24 +209,28 @@ def eval_detect_inline(dataset, eval_idxs, model):
 
             # --- Manual Transformer Forward Pass ---
             hidden_states = full_prompt_emb
+            # Position IDs should match the total sequence length
             position_ids = torch.arange(0, total_prompt_len, device=model.device).unsqueeze(0)
             for block in model.text.blocks:
                  block_output = block(
                      hidden_states,
                      use_cache=True,
+                     # Pass position IDs relevant to the current hidden_states length
                      position_ids=position_ids[:, :hidden_states.size(1)],
                  )
                  hidden_states = block_output[0]
 
             hidden_states = model.text.norm(hidden_states)
-            last_hidden = hidden_states[:, -1:, :] # State after full prompt
+            # last_hidden is state after the *last token* of the full prompt
+            last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
 
             # --- Predict Initial Token for Generation ---
             next_logits = model.text.lm_head(last_hidden)
             initial_next_token_id = torch.argmax(next_logits, dim=-1)
 
             # 4. Generate Region Points (Replaces original call)
-            gen_pos = total_prompt_len # Start generation after the prompt
+            # Generation starts *after* the full prompt sequence
+            gen_pos = total_prompt_len
             objs = model._generate_points(
                 last_hidden,
                 next_token=initial_next_token_id, # Use predicted token
@@ -238,7 +239,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
                 max_objects=DEFAULT_MAX_OBJECTS
             )
 
-        # --- Ground Truth Processing (Same as your corrected version) ---
+        # --- Ground Truth Processing (Remains the same) ---
         gt_boxes = []
         for box_data in sample["boxes"].detach().cpu().tolist():
              x_min_n, y_min_n, w_n, h_n = box_data
@@ -248,16 +249,15 @@ def eval_detect_inline(dataset, eval_idxs, model):
              y_min_n = max(0.0, min(1.0, y_min_n))
              x_max_n = max(0.0, min(1.0, x_max_n))
              y_max_n = max(0.0, min(1.0, y_max_n))
-             gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n]) # Format for compute_map
+             gt_boxes.append([x_min_n, y_min_n, x_max_n, y_max_n])
 
         preds.append(objs)
         gts.append(gt_boxes)
 
-        # --- Visualization (Same as your corrected version) ---
+        # --- Visualization (Remains the same) ---
         if idx == first_idx:
-            # Use .get for safer access to class_names
             sample_class = sample.get("class_names", ["unknown"])[0].replace('-', ' ')
-            print(f"\nRUNNING EVAL (Replacement) for class placeholder: `{sample_class}`")
+            print(f"\nRUNNING EVAL (Corrected Dim) for class placeholder: `{sample_class}`")
             print("RESULT", str(objs))
             print(f"EXPECTED (norm xywh): {sample['boxes']}")
 
@@ -284,16 +284,14 @@ def eval_detect_inline(dataset, eval_idxs, model):
                 y_max_px = max(0, min(h_img - 1, y_max_px))
                 draw.rectangle([x_min_px, y_min_px, x_max_px, y_max_px], outline="green", width=2)
 
-            # Log to wandb (same logic, potentially update key)
             wandb.log({
-                "eval/example_detect_replacement": # Consider a new key
-                    wandb.Image(vis, caption="Detect via Inline Ref (Replacement Eval)")
+                "eval/example_detect_corrected_dim": # Updated key
+                    wandb.Image(vis, caption="Detect via Inline Ref (Corrected Dim Eval)")
             })
 
-    # --- Return mAP (Same as original) ---
-    # Add basic check for empty lists before calling compute_map
+    # --- Return mAP (Remains the same) ---
     if not preds or not gts:
-        print("Warning: No predictions or ground truths to compute mAP.")
+        # print("Warning: No predictions or ground truths to compute mAP.") # Optional
         return 0.0
     return compute_map(preds, gts)
 
