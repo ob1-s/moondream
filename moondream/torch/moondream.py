@@ -486,74 +486,33 @@ class MoondreamModel(nn.Module):
 
         return out
 
-    def detect_with_reference(
+
+        def detect_with_inline_reference(
         self,
         image: Union[Image.Image, EncodedImage],
         reference: Union[Image.Image, EncodedImage],
         settings: Optional[ObjectSamplingSettings] = None,
     ):
         """
-        Detect objects in `image` matching `reference` by:
-         - encoding each separately (so you can reuse or cache them),
-         - concatenating their caches,
-         - then running the region head as usual.
+        Detects objects in 'image' using 'reference' image as the target class.
+        Constructs a prompt embedding: [BOS] [IMG] [PREFIX] [REF_IMG_EMB] [SUFFIX]
+        and generates bounding boxes.
         """
-        # 1) get separate EncodedImage for each
-        enc_img = image if isinstance(image, EncodedImage) else self.encode_image(image)
-        enc_ref = reference if isinstance(reference, EncodedImage) else self.encode_image(reference)
-
-        # 2) stitch their caches together
-        #    note: pos will be sum of their prefix lengths
-        total_pos = enc_img.pos + enc_ref.pos
-        merged_caches = []
-        for (k1, v1), (k2, v2) in zip(enc_img.caches, enc_ref.caches):
-            # k1: [1, H, pos1, D], k2: [1, H, pos2, D]
-            k = torch.cat([k1, k2], dim=2)  # along seq dimension
-            v = torch.cat([v1, v2], dim=2)
-            merged_caches.append((k, v))
-
-        # 3) load that merged cache back into the model
-        merged = EncodedImage(pos=total_pos, caches=merged_caches)
-        self.load_encoded_image(merged)
-
-        # 4) build & prefill a tiny detect prompt
-        detect_prompt = "\n\nDetect <REF>\n\n"
-        prompt_ids = self.tokenizer.encode(detect_prompt).ids
-        prompt_tokens = torch.tensor([prompt_ids], device=self.device)
-
-        _, hidden, next_token, pos_after = self._prefill_prompt(
-            prompt_tokens, total_pos, temperature=0, top_p=0
-        )
-        hidden = hidden[:, -1:, :]
-
-        # 5) decode region tokens as normal
-        max_objects = (
-            settings.get("max_objects", DEFAULT_MAX_OBJECTS)
-            if settings
-            else DEFAULT_MAX_OBJECTS
-        )
-        objs = self._generate_points(
-            hidden, next_token, pos_after, include_size=True, max_objects=max_objects
-        )
-        return {"objects": objs}
-
-    def detect_with_inline_reference(
-        self,
-        image: Union[Image.Image, EncodedImage],
-        reference: Union[Image.Image, EncodedImage],
-        settings: Optional[ObjectSamplingSettings] = None,
-    ):
         with torch.inference_mode():
             # 1. Compute vision embeddings for scene + reference
-            # _run_vision_encoder returns shape [1, D] after projection
-            img_emb_flat = self._run_vision_encoder(image)[None]
-            ref_emb_flat = self._run_vision_encoder(reference)[None]
+            # _run_vision_encoder returns shape [1, D] after projection in this context
+            img_emb_flat = self._run_vision_encoder(image) # Shape: [1, D]
+            ref_emb_flat = self._run_vision_encoder(reference) # Shape: [1, D]
 
             # Reshape to [1, 1, D] for sequence concatenation
-            img_emb = img_emb_flat.to(self.device)
-            ref_emb = ref_emb_flat.to(self.device)
+            img_emb = img_emb_flat.unsqueeze(1).to(self.device) # Shape: [1, 1, D]
+            ref_emb = ref_emb_flat.unsqueeze(1).to(self.device) # Shape: [1, 1, D]
 
-            # Use the "detect" template structure, adding space before reference embed
+            # 2. Get text embeddings for prefix, suffix, and BOS
+            if self.config.tokenizer.templates["detect"] is None:
+                raise NotImplementedError("Model does not support object detection templates.")
+
+            # Use the "detect" template structure, adding space token (ID 220) before reference embed
             prefix_ids = self.config.tokenizer.templates["detect"]["prefix"] + [220] # Add space token ID
             suffix_ids = self.config.tokenizer.templates["detect"]["suffix"]
 
@@ -572,12 +531,7 @@ class MoondreamModel(nn.Module):
                 self.text,
             ) # Shape: [1, 1, D]
 
-            print("bos_emb:", bos_emb.shape)
-            print("img_emb:", img_emb.shape)
-            print("prefix_emb:", prefix_emb.shape)
-            print("ref_emb:", ref_emb.shape)
-            print("suffix_emb:", suffix_emb.shape)
-            # 3. Construct Full Prompt Embedding: [BOS] [IMG] [PREFIX] [REF_IMG_EMB] [SUFFIX]
+            # 3. Construct Full Prompt Embedding: [BOS] [IMG] [PREFIX+SPACE] [REF_IMG_EMB] [SUFFIX]
             full_prompt_emb = torch.cat([
                 bos_emb,    # [1, 1, D]
                 img_emb,    # [1, 1, D]
@@ -587,9 +541,9 @@ class MoondreamModel(nn.Module):
             ], dim=1) # Concatenates along sequence dim
             total_prompt_len = full_prompt_emb.size(1)
 
-
             # 4. Process Prompt using _prefill
             # --- Reset KV Cache ---
+            # Ensure a clean state as this prompt structure differs from standard query/caption
             if hasattr(self.text, 'blocks') and self.text.blocks:
                 for block in self.text.blocks:
                      if hasattr(block, 'kv_cache') and block.kv_cache is not None:
@@ -601,34 +555,38 @@ class MoondreamModel(nn.Module):
             # Use the model's precomputed causal mask, sliced appropriately
             if not hasattr(self, 'attn_mask') or self.attn_mask is None:
                  raise AttributeError("Model 'attn_mask' is not initialized.")
+            # Slice the attention mask for the full prompt length
             attn_mask = self.attn_mask[:, :, :total_prompt_len, :total_prompt_len]
-            position_ids = torch.arange(0, total_prompt_len, device=self.device).unsqueeze(0)
+            # Create position IDs for the full prompt sequence
+            position_ids = torch.arange(0, total_prompt_len, device=self.device, dtype=torch.long).unsqueeze(0)
 
-            # Call _prefill to process the entire prompt and populate cache
+            # Call _prefill to process the entire prompt and populate the KV cache
             hidden_states = self._prefill(full_prompt_emb, attn_mask, position_ids)
 
-            # last_hidden is state after the *last token* of the full prompt
+            # Get the hidden state corresponding to the *last* token of the input prompt
+            # This state will be used to predict the first token of the output (coordinate) sequence
             last_hidden = hidden_states[:, -1:, :] # Shape: [1, 1, D]
 
-
-            # 5. Predict Initial Token for Generation
+            # 5. Predict Initial Token for Generation (should be the start of x-coord)
+            # Use temperature=0 for deterministic coordinate start prediction
             next_logits = lm_head(last_hidden, self.text) # Use lm_head helper
-            initial_next_token_id = torch.argmax(next_logits, dim=-1) # Shape: [1, 1]
+            initial_next_token = torch.argmax(next_logits, dim=-1) # Shape: [1, 1]
 
-
-            # 6. Generate Region Points
-            # Generation starts *after* the full prompt sequence
+            # 6. Generate Region Points (Bounding Boxes)
+            # Generation starts *after* the full prompt sequence.
+            # The KV cache is already populated by _prefill up to total_prompt_len.
             gen_pos = total_prompt_len
             max_objects = (
                 settings.get("max_objects", DEFAULT_MAX_OBJECTS)
                 if settings
                 else DEFAULT_MAX_OBJECTS
             )
+
             objs = self._generate_points(
-                last_hidden,                     # Start generation from state after prompt
-                next_token=initial_next_token_id, # Use predicted first token (should be x-coord start)
-                pos=gen_pos,                     # Start position for generation KV cache updates
-                include_size=True,               # We want bounding boxes
+                hidden=last_hidden,                  # Start generation from state after prompt
+                next_token=initial_next_token,       # Use predicted first token (should be x-coord start)
+                pos=gen_pos,                         # Start position for generation KV cache updates
+                include_size=True,                   # We want bounding boxes (x, y, w, h)
                 max_objects=max_objects
             )
 
