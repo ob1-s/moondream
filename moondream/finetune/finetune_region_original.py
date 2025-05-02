@@ -10,7 +10,7 @@ from bitsandbytes.optim import AdamW
 import wandb
 
 from ..torch.weights import load_weights_into_model
-from ..torch.moondream import MoondreamModel, MoondreamConfig, text_encoder
+from ..torch.moondream import MoondreamModel, MoondreamConfig, text_encoder, EncodedImage, DEFAULT_MAX_OBJECTS
 from ..torch.text import _produce_hidden
 from ..torch.region import (
     decode_coordinate,
@@ -19,6 +19,8 @@ from ..torch.region import (
     encode_size,
 )
 
+from PIL import Image, ImageDraw
+import random
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
 MODEL_PATH = "/kaggle/working/moondream/models/moondream_base.safetensors"
@@ -148,7 +150,7 @@ def compute_map(preds, gts, iou_threshold=0.5):
     return sum(all_precisions) / len(all_precisions) if all_precisions else 0.0
 
 
-def eval_detect_ref(dataset, eval_idxs, model):
+def eval_detect(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
     first_idx = eval_idxs[0]
@@ -178,8 +180,8 @@ def eval_detect_ref(dataset, eval_idxs, model):
                     width=2,
                 )
             wandb.log({
-                "eval/example_detectref":
-                    wandb.Image(vis, caption="Detect<REF> via native API")
+                "eval/example_detect":
+                    wandb.Image(vis, caption="Detect via native API")
             })
 
     return compute_map(preds, gts)
@@ -277,7 +279,7 @@ def main():
     pbar = tqdm(total=total_steps)
 
     # pre‐finetune eval
-    mAP0 = eval_detect_inline(dataset, eval_idxs, model)
+    mAP0 = eval_detect(dataset, eval_idxs, model)
     wandb.log({"mAP_v1": mAP0})
     model.train()
 
@@ -404,7 +406,7 @@ def main():
                 )
         
         # post‐epoch eval
-        mAP_e = eval_detect_inline(dataset, eval_idxs, model)
+        mAP_e = eval_detect(dataset, eval_idxs, model)
         wandb.log({"mAP_v1": mAP_e})
         model.train()
       
