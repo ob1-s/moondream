@@ -436,8 +436,7 @@ def main():
     load_weights_into_model(MODEL_PATH, model, device="cuda:1")
 
     for p in model.vision.parameters(): p.requires_grad = False
-    for p in model.region.parameters(): p.requires_grad = True
-    for p in model.text.parameters():   p.requires_grad = True
+    for p in model.text.parameters():   p.requires_grad = False
     for p in model.vision.proj_mlp.fc1.parameters(): p.requires_grad = True
     for p in model.vision.proj_mlp.fc2.parameters(): p.requires_grad = True
 
@@ -453,7 +452,7 @@ def main():
             {"params": model.region.parameters(), "lr": LR},
             {"params": model.vision.proj_mlp.fc1.parameters(), "lr": LR},
             {"params": model.vision.proj_mlp.fc2.parameters(), "lr": LR},
-            {"params": model.text.parameters(), "lr": LR},
+            # {"params": model.text.parameters()},
         ],
         lr=LR,
         betas=(0.9, 0.95),
@@ -496,22 +495,23 @@ def main():
             img_emb = model._run_vision_encoder(sample["image"])      # [D]
             ref_emb = model._run_vision_encoder(sample["reference"])  # [D]
 
-            prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]
-            prefix_ids_w_leading_space = model.config.tokenizer.templates["detect"]["prefix"]+[220]
-            suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-            prefix_emb = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
-            prefix_emb_w_leading_space = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
-            suffix_emb = text_encoder(torch.tensor([suffix_ids], device=model.device), model.text).squeeze(0)
+            with torch.no_grad():
+                prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]
+                prefix_ids_w_leading_space = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+                suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
+                prefix_emb = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
+                prefix_emb_w_leading_space = text_encoder(torch.tensor([prefix_ids], device=model.device), model.text).squeeze(0)
+                suffix_emb = text_encoder(torch.tensor([suffix_ids], device=model.device), model.text).squeeze(0)
 
-            # 2) Build the shared text prefix: [BOS][IMG][REF]
-            bos_emb = text_encoder(
-                torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
-                model.text,
-            )                        # [1,1,D]
-            eos_emb = text_encoder(
-                torch.tensor([[model.config.tokenizer.eos_id]], device=model.device),
-                model.text,
-            )                        # [1,1,D]
+                # 2) Build the shared text prefix: [BOS][IMG][REF]
+                bos_emb = text_encoder(
+                    torch.tensor([[model.config.tokenizer.bos_id]], device=model.device),
+                    model.text,
+                )                        # [1,1,D]
+                eos_emb = text_encoder(
+                    torch.tensor([[model.config.tokenizer.eos_id]], device=model.device),
+                    model.text,
+                )                        # [1,1,D]
 
             # note: instruction and region tokens come after these
             # so prefix_len = 1 (BOS) + 1 (IMG) + instr_len
@@ -529,11 +529,12 @@ def main():
             for _cls, boxes_list in boxes_by_class.items():
                 use_class = (random.random() < frac_class_epoch)
                 if use_class:
-                    cls_emb = text_encoder(torch.tensor([
-                        model.tokenizer.encode(
-                            " "+_cls.replace('-', ' ').strip()
-                        ).ids
-                    ], device=model.device), model.text).squeeze(0)  
+                    with torch.no_grad():
+                        cls_emb = text_encoder(torch.tensor([
+                            model.tokenizer.encode(
+                                " "+_cls.replace('-', ' ').strip()
+                            ).ids
+                        ], device=model.device), model.text).squeeze(0)  
                     
                     instruction_emb = torch.cat([
                         prefix_emb.unsqueeze(0),   # [1, prefix_len, D]
