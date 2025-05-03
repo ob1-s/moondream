@@ -159,36 +159,38 @@ def compute_map(preds, gts, iou_threshold=0.5):
 def eval_detect_inline(dataset, eval_idxs, model):
     model.eval()
     preds, gts = [], []
-    first_idx = eval_idxs[0]
+    first_idsx = eval_idxs[:3]
 
-    # grab the precomputed prefix / suffix id lists from your tokenizer
-    prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
-    suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
-
-    # 1) text‐encode the prefix and suffix (they’re fixed)
-    prefix_emb = text_encoder(
-        torch.tensor([prefix_ids], device=model.device),
-        model.text,
-    )  # [1, prefix_len, D]
-
-    suffix_emb = text_encoder(
-        torch.tensor([suffix_ids], device=model.device),
-        model.text,
-    )  # [1, suffix_len, D]
+    with torch.no_grad():
+        # grab the precomputed prefix / suffix id lists from your tokenizer
+        prefix_ids = model.config.tokenizer.templates["detect"]["prefix"]+[220]
+        suffix_ids = model.config.tokenizer.templates["detect"]["suffix"]
+    
+        # 1) text‐encode the prefix and suffix (they’re fixed)
+        prefix_emb = text_encoder(
+            torch.tensor([prefix_ids], device=model.device),
+            model.text,
+        )  # [1, prefix_len, D]
+    
+        suffix_emb = text_encoder(
+            torch.tensor([suffix_ids], device=model.device),
+            model.text,
+        )  # [1, suffix_len, D]
 
     HARDCODED_TEST_IMG_BASE = Image.open("./moondream/finetune/Preview.png")
     HARDCODED_TEST_IMG_obj_1 = Image.open("./moondream/finetune/blaster-d.png")
     HARDCODED_TEST_IMG_obj_2 = Image.open("./moondream/finetune/blaster-p.png")
     HARDCODED_TEST_IMG_obj_3 = Image.open("./moondream/finetune/target-detail.png")
 
-    # RUN HARDCODED TEST
-    ref_emb = model._run_vision_encoder(HARDCODED_TEST_IMG_obj_1)[None]
-    result = model.detect_with_inline_reference(
-        HARDCODED_TEST_IMG_BASE,
-        ref_emb,
-        settings={"max_objects": DEFAULT_MAX_OBJECTS},
-    )
-    objs = result["objects"]
+    with torch.no_grad():
+        # RUN HARDCODED TEST
+        ref_emb = model._run_vision_encoder(HARDCODED_TEST_IMG_obj_1)[None]
+        result = model.detect_with_inline_reference(
+            HARDCODED_TEST_IMG_BASE,
+            ref_emb,
+            settings={"max_objects": DEFAULT_MAX_OBJECTS},
+        )
+        objs = result["objects"]
     
     preds.append(objs)      # objs is already a list of dicts with normalized corners
 
@@ -253,7 +255,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
 
 
         # 2) on the very first eval sample, draw & log its predictions
-        if idx == first_idx:
+        if idx in first_idsx:
             print(f"\nRUNNING EVAL for class `{sample_class}`")
             print("RESULT", str(objs))
             print(f"EXPECTED: {sample['boxes']}")
@@ -302,8 +304,7 @@ def eval_detect_inline(dataset, eval_idxs, model):
                     width=2,
                 )
             wandb.log({
-                "eval/example_detect":
-                    wandb.Image(vis, caption="Detect via native API")
+                f"eval/example_detect_{idx}": wandb.Image(vis, caption="Detect via native API")
             })
 
     return compute_map(preds, gts)
@@ -437,6 +438,7 @@ def main():
 
     for p in model.vision.parameters(): p.requires_grad = False
     for p in model.text.parameters():   p.requires_grad = False
+    for p in model.region.parameters(): p.requires_grad = True
     for p in model.vision.proj_mlp.fc1.parameters(): p.requires_grad = True
     for p in model.vision.proj_mlp.fc2.parameters(): p.requires_grad = True
 
@@ -464,8 +466,8 @@ def main():
     dataset = GroundedDetection()
     print(f"GroundedDetection: {len(dataset)} items.")
     idxs = list(range(len(dataset)))
-    train_idxs = idxs[:2048]
-    eval_idxs = idxs[2048:2048+128]
+    train_idxs = idxs[:3072]
+    eval_idxs = idxs[3072:3072+128]
 
     total_steps = EPOCHS * len(train_idxs) // GRAD_ACCUM_STEPS
     pbar = tqdm(total=total_steps)
@@ -483,7 +485,7 @@ def main():
             random.shuffle(train_idxs)
             
         frac_class_epoch = 0.8 * (1 - epoch / (EPOCHS - 1))
-        wandb.log({"frac_class_epoch": frac_class_epoch}, step=epoch)
+        wandb.log({"frac_class_epoch": frac_class_epoch})
         
         for sample_idx in train_idxs:
             sample = dataset[sample_idx]
